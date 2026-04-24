@@ -1,0 +1,42 @@
+from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+
+class Article(Base):
+    __tablename__ = 'articles'
+
+    id = Column(Integer, primary_key=True, index=True)
+    q_id = Column(String(50), index=True, nullable=True)
+    url = Column(String(500), unique=True, nullable=False)
+    title = Column(String(255), nullable=False)
+    language = Column(String(10), nullable=False)
+
+    references = relationship("Reference", back_populates="article", cascade="all, delete-orphan")
+
+
+class Reference(Base):
+    __tablename__ = 'references'
+
+    id = Column(Integer, primary_key=True, index=True)
+    article_id = Column(Integer, ForeignKey('articles.id'), nullable=False)
+    raw_text = Column(Text, nullable=False)
+    ref_type = Column(String(50))  # e.g., 'cite journal', 'cite q'
+    doi = Column(String(100), index=True)
+    pmid = Column(String(100), index=True)
+    arxiv = Column(String(100), index=True)
+
+    article = relationship("Article", back_populates="references")
+    wikidata_mapping = relationship("WikidataMapping", back_populates="reference", uselist=False,
+                                    cascade="all, delete-orphan")
+
+
+class WikidataMapping(Base):
+    __tablename__ = 'wikidata_mappings'
+
+    id = Column(Integer, primary_key=True, index=True)
+    reference_id = Column(Integer, ForeignKey('references.id'), nullable=False, unique=True)
+    q_id = Column(String(50), index=True, nullable=False)
+
+    reference = relationship("Reference", back_populates="wikidata_mapping")
