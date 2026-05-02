@@ -7,12 +7,8 @@ Base = declarative_base()
 class Article(Base):
     __tablename__ = 'articles'
 
-    id = Column(Integer, primary_key=True, index=True)
-    q_id = Column(String(50), index=True, nullable=True)
-    url = Column(String(500), unique=True, nullable=False)
-    title = Column(String(255), nullable=False)
-    language = Column(String(10), nullable=False)
-
+    # q_id is the primary identifier for the entity
+    q_id = Column(String(50), primary_key=True, index=True)
     references = relationship("Reference", back_populates="article", cascade="all, delete-orphan")
 
 
@@ -20,9 +16,15 @@ class Reference(Base):
     __tablename__ = 'references'
 
     id = Column(Integer, primary_key=True, index=True)
-    article_id = Column(Integer, ForeignKey('articles.id'), nullable=False)
+    article_q_id = Column(String(50), ForeignKey('articles.q_id'), nullable=False)
+
+    # Source tracking moved to the reference level
+    language = Column(String(10), nullable=False)
+    source_url = Column(String(500), nullable=False)
+
     raw_text = Column(Text, nullable=False)
-    ref_type = Column(String(50))  # e.g., 'cite journal', 'cite q'
+    context_text = Column(Text, nullable=True)
+    ref_type = Column(String(50))
     doi = Column(String(100), index=True)
     pmid = Column(String(100), index=True)
     arxiv = Column(String(100), index=True)

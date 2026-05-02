@@ -5,7 +5,7 @@ fastapi uvicorn sqlalchemy aiomysql httpx beautifulsoup4 mwparserfromhell pydant
 uvicorn main:app --reload
 
 #eksempel get
-curl -X GET "http://localhost:8000/database/2/"
+curl -X GET "http://localhost:8000/database/dump/"
 
 #eksempel scrape
 curl -H "Content-Type: application/json" -d "{\"url\":\"https://en.wikipedia.org/wiki/Jeffrey_T._Williams\"}" -X POST "http://localhost:8000/scrape/"
