@@ -18,9 +18,12 @@ async def execute_sparql(query: str) -> dict:
                 timeout=10.0
             )
             response.raise_for_status()
+
             return response.json()
         except Exception as e:
+            print("---------ERROR---------")
             logging.error(f"QLever query failed: {e}")
+            print("-----------------------")
             return {}
 
 
@@ -215,3 +218,29 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
             })
 
     return citations
+
+
+async def get_wikidata_labels(q_id: str) -> list[dict]:
+    """Fetches all localized name labels for a given Q-ID."""
+    if not q_id:
+        return []
+
+    query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+
+    SELECT ?lang ?label WHERE {{
+      wd:{q_id} rdfs:label ?label .
+      BIND(LANG(?label) AS ?lang)
+    }}
+    """
+    data = await execute_sparql(query)
+
+    results = []
+    for item in data.get("results", {}).get("bindings", []):
+        lang_code = item.get("lang", {}).get("value")
+        label = item.get("label", {}).get("value")
+        if lang_code and label:
+            results.append({"lang": lang_code, "title": label})
+
+    return results
