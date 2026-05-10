@@ -1,109 +1,165 @@
 import httpx
 import logging
+
 from config import settings
 
 
 async def execute_sparql(query: str) -> dict:
-    #Executor for SPARQL queries to QLever.
+    """Executor for SPARQL queries to QLever."""
     headers = {
         "Accept": "application/sparql-results+json",
         "User-Agent": f"{settings.bot_name}/{settings.bot_version} (Contact: {settings.contact_email})"
     }
+    print("executing query:\n", query)
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
+            response = await client.get(
                 settings.qlever_url,
-                data={"query": query},
+                params={"query": query},
                 headers=headers,
-                timeout=10.0
+                timeout=30.0
             )
             response.raise_for_status()
-
             return response.json()
+        except httpx.HTTPStatusError as e:
+            logging.error(f"QLever HTTP {e.response.status_code} Error: {e.response.text}")
+            return {}
         except Exception as e:
-            print("---------ERROR---------")
-            logging.error(f"QLever query failed: {e}")
-            print("-----------------------")
+            logging.error(f"QLever connection failed: {repr(e)}")
             return {}
 
 
-async def resolve_doi_to_qid(doi_input: str | list[str]) -> dict[str, str]:
-    # Accepts a single DOI or a list of DOIs, returns a dict mapping DOI to Q-ID.
-    if not doi_input:
-        return {}
+async def resolve_references_batch(
+        dois: list[str], qids: list[str]
+) -> tuple[dict[str, str], dict[str, dict]]:
+    if not dois and not qids:
+        return {}, {}
 
-    # Normalize input to a list
-    dois = [doi_input] if isinstance(doi_input, str) else doi_input
-    values_str = " ".join([f'"{doi}"' for doi in dois])
+    union_parts: list[str] = []
 
-    query = f"""
-    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-    SELECT ?doi ?item WHERE {{
-      VALUES ?doi {{ {values_str} }}
-      ?item wdt:P356 ?doi .
-    }}
-    """
-    data = await execute_sparql(query)
-    results = data.get("results", {}).get("bindings", [])
+    if dois:
+        values_str = " ".join(f'"{doi}"' for doi in dois)
+        union_parts.append(f"""
+        {{
+          BIND("doi" AS ?queryType)
+          VALUES ?inputDoi {{ {values_str} }}
+          ?item wdt:P356 ?inputDoi .
+        }}""")
 
-    mapping = {}
-    for row in results:
-        doi_val = row.get("doi", {}).get("value")
-        item_uri = row.get("item", {}).get("value", "")
-        if doi_val and item_uri:
-            mapping[doi_val] = item_uri.split("/")[-1]
+    if qids:
+        values_str = " ".join(f"wd:{qid}" for qid in qids)
+        union_parts.append(f"""
+        {{
+          BIND("qid" AS ?queryType)
+          VALUES ?item {{ {values_str} }}
+          OPTIONAL {{ ?item wdt:P356 ?doi . }}
+          OPTIONAL {{ ?item wdt:P698 ?pmid . }}
+          OPTIONAL {{ ?item wdt:P818 ?arxiv . }}
+        }}""")
 
-    return mapping
-
-
-async def resolve_qid_to_identifiers(qid_input: str | list[str]) -> dict[str, dict]:
-    # Accepts a single Q-ID or a list of Q-IDs, returns a dict mapping Q-ID to identifiers.
-    if not qid_input:
-        return {}
-
-    # Normalize input to a list
-    qids = [qid_input] if isinstance(qid_input, str) else qid_input
-    values_str = " ".join([f"wd:{qid}" for qid in qids])
+    union_str = " UNION ".join(union_parts)
 
     query = f"""
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
     PREFIX wd: <http://www.wikidata.org/entity/>
-    SELECT ?item ?doi ?pmid ?arxiv WHERE {{
-      VALUES ?item {{ {values_str} }}
-      OPTIONAL {{ ?item wdt:P356 ?doi . }}
-      OPTIONAL {{ ?item wdt:P698 ?pmid . }}
-      OPTIONAL {{ ?item wdt:P818 ?arxiv . }}
-    }}
+    SELECT ?queryType ?inputDoi ?item ?doi ?pmid ?arxiv WHERE {{
+      {union_str}
+    }} LIMIT 10000
     """
     data = await execute_sparql(query)
     results = data.get("results", {}).get("bindings", [])
 
-    mapping = {}
+    doi_to_qid: dict[str, str] = {}
+    qid_to_identifiers: dict[str, dict] = {}
+
     for row in results:
+        query_type = row.get("queryType", {}).get("value")
         item_uri = row.get("item", {}).get("value", "")
         qid = item_uri.split("/")[-1] if item_uri else None
-        if qid:
-            mapping[qid] = {
+
+        if query_type == "doi" and qid:
+            input_doi = row.get("inputDoi", {}).get("value")
+            if input_doi:
+                doi_to_qid[input_doi] = qid
+
+        elif query_type == "qid" and qid:
+            qid_to_identifiers[qid] = {
                 "doi": row.get("doi", {}).get("value"),
                 "pmid": row.get("pmid", {}).get("value"),
-                "arxiv": row.get("arxiv", {}).get("value")
+                "arxiv": row.get("arxiv", {}).get("value"),
             }
 
-    return mapping
+    return doi_to_qid, qid_to_identifiers
+
+
+async def get_entity_context(q_id: str) -> dict:
+    if not q_id:
+        return {"labels": [], "works": []}
+
+    query = f"""
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?resultType ?lang ?label ?work ?workLabel ?doi ?pmid ?arxiv WHERE {{
+      {{
+        BIND("label" AS ?resultType)
+        wd:{q_id} rdfs:label ?label .
+        BIND(LANG(?label) AS ?lang)
+      }} UNION {{
+        BIND("work" AS ?resultType)
+        ?work wdt:P50 wd:{q_id} .
+        OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
+        OPTIONAL {{ ?work wdt:P356 ?doi . }}
+        OPTIONAL {{ ?work wdt:P698 ?pmid . }}
+        OPTIONAL {{ ?work wdt:P818 ?arxiv . }}
+      }}
+    }} LIMIT 10000
+    """
+    data = await execute_sparql(query)
+    results = data.get("results", {}).get("bindings", [])
+
+    labels: list[dict] = []
+    works: list[dict] = []
+    seen_work_qids: set[str] = set()
+
+    for row in results:
+        result_type = row.get("resultType", {}).get("value")
+
+        if result_type == "label":
+            lang_code = row.get("lang", {}).get("value")
+            label_val = row.get("label", {}).get("value")
+            if lang_code and label_val:
+                labels.append({"lang": lang_code, "title": label_val})
+
+        elif result_type == "work":
+            work_uri = row.get("work", {}).get("value", "")
+            work_qid = work_uri.split("/")[-1] if work_uri else None
+
+            if work_qid and work_qid not in seen_work_qids:
+                seen_work_qids.add(work_qid)
+                works.append({
+                    "work_qid": work_qid,
+                    "label": row.get("workLabel", {}).get("value", "Unknown Label"),
+                    "doi": row.get("doi", {}).get("value"),
+                    "pmid": row.get("pmid", {}).get("value"),
+                    "arxiv": row.get("arxiv", {}).get("value"),
+                })
+
+    return {"labels": labels, "works": works}
 
 
 async def get_author_works(author_qid: str) -> list[dict]:
-    # Find works authored by a specific QID using P50 (author).
     if not author_qid:
         return []
+
     query = f"""
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?work ?workLabel WHERE {{
-      ?work wdt:P50 wd:{author_qid.capitalize()} .
+      ?work wdt:P50 wd:{author_qid.upper()} .
       OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
-    }}
+    }} LIMIT 10000
     """
     data = await execute_sparql(query)
     results = data.get("results", {}).get("bindings", [])
@@ -115,45 +171,15 @@ async def get_author_works(author_qid: str) -> list[dict]:
         if work_qid:
             works.append({
                 "work_qid": work_qid,
-                "label": row.get("workLabel", {}).get("value", "Unknown Label")
+                "label": row.get("workLabel", {}).get("value", "Unknown Label"),
             })
     return works
 
 
-async def get_publication_citations(pub_qid: str) -> list[dict]:
-    # Find all items that this publication cites using P2860 (cites work).
-    if not pub_qid:
-        return []
-    query = f"""
-    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-    PREFIX wd: <http://www.wikidata.org/entity/>
-    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-    SELECT ?citedWork ?citedWorkLabel WHERE {{
-      wd:{pub_qid} wdt:P2860 ?citedWork .
-      OPTIONAL {{ ?citedWork rdfs:label ?citedWorkLabel . FILTER(LANG(?citedWorkLabel) = "en") }}
-    }}
-    """
-    data = await execute_sparql(query)
-    results = data.get("results", {}).get("bindings", [])
-
-    citations = []
-    for row in results:
-        cited_uri = row.get("citedWork", {}).get("value", "")
-        cited_qid = cited_uri.split("/")[-1] if cited_uri else None
-        if cited_qid:
-            citations.append({
-                "cited_qid": cited_qid,
-                "label": row.get("citedWorkLabel", {}).get("value", "Unknown Label")
-            })
-    return citations
-
-
 async def get_citations_for_author(author_qid: str) -> list[dict]:
-    # Find works that cite the publications of a specific author.
     if not author_qid:
         return []
 
-    # Using the exact logic from your provided SPARQL query, enhanced with labels
     query = f"""
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
     PREFIX wd: <http://www.wikidata.org/entity/>
@@ -163,7 +189,7 @@ async def get_citations_for_author(author_qid: str) -> list[dict]:
       ?citingWork wdt:P2860 ?work .
       OPTIONAL {{ ?citingWork rdfs:label ?citingWorkLabel . FILTER(LANG(?citingWorkLabel) = "en") }}
       OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
-    }}
+    }} LIMIT 10000
     """
     data = await execute_sparql(query)
     results = data.get("results", {}).get("bindings", [])
@@ -172,7 +198,6 @@ async def get_citations_for_author(author_qid: str) -> list[dict]:
     for row in results:
         citing_uri = row.get("citingWork", {}).get("value", "")
         citing_qid = citing_uri.split("/")[-1] if citing_uri else None
-
         work_uri = row.get("work", {}).get("value", "")
         work_qid = work_uri.split("/")[-1] if work_uri else None
 
@@ -181,9 +206,8 @@ async def get_citations_for_author(author_qid: str) -> list[dict]:
                 "citing_work_qid": citing_qid,
                 "citing_work_label": row.get("citingWorkLabel", {}).get("value", "Unknown Label"),
                 "original_work_qid": work_qid,
-                "original_work_label": row.get("workLabel", {}).get("value", "Unknown Label")
+                "original_work_label": row.get("workLabel", {}).get("value", "Unknown Label"),
             })
-
     return citations
 
 
@@ -199,7 +223,7 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
       ?citingWork wdt:P2860 wd:{work_qid} .
       OPTIONAL {{ ?citingWork rdfs:label ?citingWorkLabel . FILTER(LANG(?citingWorkLabel) = "en") }}
       OPTIONAL {{ wd:{work_qid} rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
-    }}
+    }} LIMIT 10000
     """
     data = await execute_sparql(query)
     results = data.get("results", {}).get("bindings", [])
@@ -208,39 +232,11 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
     for row in results:
         citing_uri = row.get("citingWork", {}).get("value", "")
         citing_qid = citing_uri.split("/")[-1] if citing_uri else None
-
         if citing_qid:
             citations.append({
                 "citing_work_qid": citing_qid,
                 "citing_work_label": row.get("citingWorkLabel", {}).get("value", "Unknown Label"),
                 "original_work_qid": work_qid,
-                "original_work_label": row.get("workLabel", {}).get("value", "Unknown Label")
+                "original_work_label": row.get("workLabel", {}).get("value", "Unknown Label"),
             })
-
     return citations
-
-
-async def get_wikidata_labels(q_id: str) -> list[dict]:
-    """Fetches all localized name labels for a given Q-ID."""
-    if not q_id:
-        return []
-
-    query = f"""
-    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-    PREFIX wd: <http://www.wikidata.org/entity/>
-
-    SELECT ?lang ?label WHERE {{
-      wd:{q_id} rdfs:label ?label .
-      BIND(LANG(?label) AS ?lang)
-    }}
-    """
-    data = await execute_sparql(query)
-
-    results = []
-    for item in data.get("results", {}).get("bindings", []):
-        lang_code = item.get("lang", {}).get("value")
-        label = item.get("label", {}).get("value")
-        if lang_code and label:
-            results.append({"lang": lang_code, "title": label})
-
-    return results

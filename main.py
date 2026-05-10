@@ -11,7 +11,12 @@ import httpx
 
 from models import Base, Article, Reference, WikidataMapping
 from scraper import scrape_all_languages_for_qid
-from qlever import resolve_doi_to_qid, resolve_qid_to_identifiers, get_author_works, get_citations_to_work, get_citations_for_author
+from qlever import (
+    resolve_references_batch,
+    get_author_works,
+    get_citations_to_work,
+    get_citations_for_author,
+)
 from config import settings
 
 engine = create_async_engine(settings.database_url, echo=False)
@@ -31,6 +36,7 @@ app = FastAPI(title="Wiki Citation Extractor", lifespan=lifespan)
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
 
 @app.get("/ok/")
 async def health_check():
@@ -52,9 +58,11 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
     # read-snapshot and forces the DB to give us the freshest data.
     await db.commit()
 
-    stmt = (select(Article)
-            .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
-            .where(Article.q_id == q_id))
+    stmt = (
+        select(Article)
+        .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
+        .where(Article.q_id == q_id)
+    )
 
     result = await db.execute(stmt)
     article = result.scalars().first()
@@ -62,37 +70,40 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
     existing_refs_map = {}
 
     if not article:
-        article = Article(q_id=q_id)
+        # Pass the scraped name to the new Article
+        article = Article(q_id=q_id, name=scraped_data["name"])
         db.add(article)
         try:
-            # Try to push the new article to the database
             await db.flush()
         except IntegrityError:
-            # Absolute worst-case scenario: Another parallel request inserted Q938
-            # in the exact millisecond between our commit and our flush.
             await db.rollback()
-
-            # Fetch the article that the other request just created
             result = await db.execute(stmt)
             article = result.scalars().first()
-
-            # Populate our references map so we update instead of inserting duplicates
+            article.name = scraped_data["name"]
             for ref in article.references:
                 existing_refs_map[(ref.raw_text, ref.language)] = ref
     else:
-        # Populate our references map normally
+        article.name = scraped_data["name"]
         for ref in article.references:
             existing_refs_map[(ref.raw_text, ref.language)] = ref
+
 
     new_refs_count = 0
     updated_refs_count = 0
 
-    dois_to_resolve = list(set([r["doi"] for r in scraped_data["references"] if not r["q_id"] and r["doi"]]))
-    qids_to_resolve = list(set([r["q_id"] for r in scraped_data["references"] if
-                                r["q_id"] and not all([r.get("doi"), r.get("pmid"), r.get("arxiv")])]))
+    dois_to_resolve = list(set(
+        r["doi"] for r in scraped_data["references"]
+        if not r["q_id"] and r["doi"]
+    ))
+    qids_to_resolve = list(set(
+        r["q_id"] for r in scraped_data["references"]
+        if r["q_id"] and not all([r.get("doi"), r.get("pmid"), r.get("arxiv")])
+    ))
 
-    resolved_dois = await resolve_doi_to_qid(dois_to_resolve) if dois_to_resolve else {}
-    resolved_qids = await resolve_qid_to_identifiers(qids_to_resolve) if qids_to_resolve else {}
+    # Single QLever round-trip replaces the two sequential calls that were here.
+    resolved_dois, resolved_qids = await resolve_references_batch(
+        dois_to_resolve, qids_to_resolve
+    )
 
     for ref_data in scraped_data["references"]:
         raw_text = ref_data["raw_text"]
@@ -114,6 +125,7 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
         if map_key in existing_refs_map:
             ref = existing_refs_map[map_key]
             ref.ref_type = ref_data["ref_type"]
+            ref.ref_name = ref_data["ref_name"]
             ref.doi = ref_data["doi"]
             ref.pmid = ref_data["pmid"]
             ref.arxiv = ref_data["arxiv"]
@@ -135,9 +147,10 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
                 raw_text=raw_text,
                 context_text=context_text,
                 ref_type=ref_data["ref_type"],
+                ref_name=ref_data["ref_name"],
                 doi=ref_data["doi"],
                 pmid=ref_data["pmid"],
-                arxiv=ref_data["arxiv"]
+                arxiv=ref_data["arxiv"],
             )
             db.add(ref)
             await db.flush()
@@ -154,90 +167,75 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
         "message": "Article sync complete.",
         "article_q_id": article.q_id,
         "new_references_added": new_refs_count,
-        "existing_references_updated": updated_refs_count
+        "existing_references_updated": updated_refs_count,
     }
+
 
 @app.get("/scrape/{q_id}/")
 async def scrape_article_endpoint(q_id: str, db: AsyncSession = Depends(get_db)):
-    # Explicit GET trigger to scrape and sync an article by Q-ID.
+    """Explicit GET trigger to scrape and sync an article by Q-ID."""
     return await sync_article_by_qid(q_id, db)
 
 
 @app.get("/database/dump/")
 async def dump_entire_database(db: AsyncSession = Depends(get_db)):
-    stmt = (
-        select(Article)
-        .options(
-            selectinload(Article.references)
-        )
-    )
-
+    stmt = select(Article).options(selectinload(Article.references))
     result = await db.execute(stmt)
     articles = result.scalars().all()
 
-    database_dump = []
-    for article in articles:
-        database_dump.append({
-            "q_id": article.q_id,
-            "references_count": len(article.references)
-        })
-
-    return {
-        "total_articles": len(database_dump),
-        "data": database_dump
-    }
+    database_dump = [
+        {"q_id": article.q_id, "references_count": len(article.references)}
+        for article in articles
+    ]
+    return {"total_articles": len(database_dump), "data": database_dump}
 
 
 @app.get("/database/{q_id}/")
 async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
-    # Returns a complete nested dump of a specific article by its Q-ID.
-    # Will strictly ONLY check the local database.
+    """Returns a complete nested dump of a specific article. Strictly local DB only."""
     q_id = q_id.strip().upper()
 
     stmt = (
         select(Article)
-        .options(
-            selectinload(Article.references).selectinload(Reference.wikidata_mapping)
-        )
+        .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
         .where(Article.q_id == q_id)
     )
-
     result = await db.execute(stmt)
     article = result.scalars().first()
 
     if not article:
-        # Fails fast if it doesn't exist locally
         raise HTTPException(
             status_code=404,
-            detail=f"Q-ID {q_id} not found in local database. Please run /scrape/{q_id}/ first."
+            detail=f"Q-ID {q_id} not found in local database. Please run /scrape/{q_id}/ first.",
         )
 
     article_data = {
         "q_id": article.q_id,
-        "references": []
+        "name": article.name,
+        "references": [
+            {
+                "id": ref.id,
+                "language": ref.language,
+                "source_url": ref.source_url,
+                "raw_text": ref.raw_text,
+                "context_text": ref.context_text,
+                "ref_type": ref.ref_type,
+                "ref_name": ref.ref_name,
+                "doi": ref.doi,
+                "pmid": ref.pmid,
+                "arxiv": ref.arxiv,
+                "q_id": ref.wikidata_mapping.q_id if ref.wikidata_mapping else None,
+            }
+            for ref in article.references
+        ],
     }
-
-    for ref in article.references:
-        ref_data = {
-            "id": ref.id,
-            "language": ref.language,
-            "source_url": ref.source_url,
-            "raw_text": ref.raw_text,
-            "context_text": ref.context_text,
-            "ref_type": ref.ref_type,
-            "doi": ref.doi,
-            "pmid": ref.pmid,
-            "arxiv": ref.arxiv,
-            "q_id": ref.wikidata_mapping.q_id if ref.wikidata_mapping else None
-        }
-        article_data["references"].append(ref_data)
-
     return article_data
+
 
 @app.get("/stats/")
 async def get_stats(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(func.count(Reference.id)).where(Reference.ref_type == 'cite q')
+        select(func.count(Reference.id)).where(Reference.ref_type == "cite q")
     )
     cite_q_count = result.scalar()
     return {"cite_q_usage_count": cite_q_count}
@@ -260,34 +258,31 @@ async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
         result = await db.execute(stmt)
         local_refs = result.scalars().all()
 
-    # Combine the data based on Q-ID
     combined_works = []
     for work in works_data:
         work_qid = work["work_qid"]
-
-        # Find any local references that match this specific work's Q-ID
         matching_local_refs = [
             {
                 "reference_id": ref.id,
                 "raw_text": ref.raw_text,
                 "context_text": ref.context_text,
                 "language": ref.language,
-                "source_url": ref.source_url
+                "source_url": ref.source_url,
             }
-            for ref in local_refs if ref.wikidata_mapping.q_id == work_qid
+            for ref in local_refs
+            if ref.wikidata_mapping.q_id == work_qid
         ]
-
         combined_works.append({
             "work_q_id": work_qid,
             "work_label": work["label"],
             "has_local_matches": len(matching_local_refs) > 0,
-            "local_references": matching_local_refs
+            "local_references": matching_local_refs,
         })
 
     return {
         "author_q_id": q_id,
         "total_works": len(combined_works),
-        "works": combined_works
+        "works": combined_works,
     }
 
 
@@ -299,12 +294,12 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
     entity_type = "author"
     citations_data = await get_citations_for_author(q_id)
 
-    # Fallback: If empty, try treating the Q-ID as a piee of work
+    # Fallback: treat the Q-ID as a piece of work
     if not citations_data:
         entity_type = "work"
         citations_data = await get_citations_to_work(q_id)
 
-    citing_qids = list(set([citation["citing_work_qid"] for citation in citations_data]))
+    citing_qids = list(set(citation["citing_work_qid"] for citation in citations_data))
 
     local_refs = []
     if citing_qids:
@@ -317,35 +312,32 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
         result = await db.execute(stmt)
         local_refs = result.scalars().all()
 
-    # Combine the data based on Q-ID
     combined_citations = []
     for citation in citations_data:
         citing_qid = citation["citing_work_qid"]
-
-        # Find any local references that match the citing work's Q-ID
         matching_local_refs = [
             {
                 "reference_id": ref.id,
                 "raw_text": ref.raw_text,
                 "context_text": ref.context_text,
                 "language": ref.language,
-                "source_url": ref.source_url
+                "source_url": ref.source_url,
             }
-            for ref in local_refs if ref.wikidata_mapping.q_id == citing_qid
+            for ref in local_refs
+            if ref.wikidata_mapping.q_id == citing_qid
         ]
-
         combined_citations.append({
             "citing_work_q_id": citing_qid,
             "citing_work_label": citation["citing_work_label"],
             "original_work_q_id": citation["original_work_qid"],
             "original_work_label": citation["original_work_label"],
             "has_local_matches": len(matching_local_refs) > 0,
-            "local_references": matching_local_refs
+            "local_references": matching_local_refs,
         })
 
     return {
         "entity_q_id": q_id,
         "resolved_as": entity_type,
         "total_citations": len(combined_citations),
-        "citations": combined_citations
+        "citations": combined_citations,
     }

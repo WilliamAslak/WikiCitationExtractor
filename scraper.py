@@ -1,15 +1,22 @@
+import asyncio
 import logging
 import httpx
 import mwparserfromhell
-import re
 import urllib
 from urllib.parse import urlparse
+
 from config import settings
-from qlever import get_wikidata_labels
+from qlever import get_entity_context
+
+_SEARCH_SEMAPHORE = asyncio.Semaphore(3)
+_FETCH_SEMAPHORE = asyncio.Semaphore(10)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
-    # Finds the tag in the raw wikitext and extracts only the preceding characters,
-    # stopping if it hits the boundary of a previous reference.
     pos = wikitext.find(tag_str)
     if pos == -1:
         return ""
@@ -17,218 +24,365 @@ def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
     start = max(0, pos - window)
     left_text = wikitext[start:pos]
 
-    # Check if a standard reference ends in our left window
     last_ref_close = left_text.rfind("</ref>")
     if last_ref_close != -1:
-        start += last_ref_close + 6  # length of "</ref>"
+        start += last_ref_close + 6
     else:
-        # Check for self-closing references (e.g., <ref name="xyz" />)
         last_ref_open = left_text.rfind("<ref")
         if last_ref_open != -1:
             close_pos = left_text.find("/>", last_ref_open)
             if close_pos != -1:
-                start += close_pos + 2  # length of "/>"
+                start += close_pos + 2
 
     return wikitext[start:pos].strip()
 
-async def get_q_id_from_name(name: str) -> str | None:
-    search_term = name.replace("_", " ")
-    url = "https://www.wikidata.org/w/api.php"
-    params = {
-        "action": "wbsearchentities",
-        "search": search_term,
-        "language": "en",
-        "format": "json"
-    }
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
 
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("search"):
-            return data["search"][0]["id"]
-    return None
+def normalize_lang_code(lang: str) -> str | None:
+    lang = lang.lower()
+    if lang == "mul":
+        return None
+    if "-" in lang:
+        return lang.split("-")[0]
+    return lang
 
+
+# ---------------------------------------------------------------------------
+# Wikidata / Wikipedia API calls
+# ---------------------------------------------------------------------------
 
 async def get_sitelinks_from_qid(q_id: str) -> dict[str, str]:
+    """Used only to know which Wikipedia language editions are highly relevant to search."""
     q_id = q_id.strip().upper()
     url = "https://www.wikidata.org/w/api.php"
     params = {
         "action": "wbgetentities",
         "ids": q_id,
         "props": "sitelinks/urls",
-        "format": "json"
+        "format": "json",
     }
     headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
 
+    async with _FETCH_SEMAPHORE:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+    entities = data.get("entities", {})
+    entity = entities.get(q_id, {})
+    sitelinks = entity.get("sitelinks", {})
+
+    urls = {}
+    for site, link_data in sitelinks.items():
+        site_url = link_data.get("url", "")
+        if "wikipedia.org" in site_url:
+            parsed_url = urlparse(site_url)
+            lang = parsed_url.netloc.split(".")[0]
+            urls[lang] = site_url
+    return urls
+
+
+async def find_mentions_via_search_query(
+        lang: str, query_str: str, max_total: int = 50
+) -> list[str]:
+    endpoint = f"https://{lang}.wikipedia.org/w/api.php"
+    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
+    all_titles: list[str] = []
+
+    data = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query_str,
+        "srnamespace": "0",
+        "srlimit": "50",
+        "format": "json",
+    }
+
     async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
+        while len(all_titles) < max_total:
+            async with _SEARCH_SEMAPHORE:
+                retries = 0
+                while True:
+                    try:
+                        response = await client.post(endpoint, data=data, timeout=15.0)
+                        if response.status_code == 429:
+                            wait = 2 ** retries
+                            logging.warning(
+                                f"429 from {lang}.wikipedia.org search — backing off {wait}s"
+                            )
+                            await asyncio.sleep(wait)
+                            retries += 1
+                            if retries > 4:
+                                return all_titles
+                            continue
+                        response.raise_for_status()
+                        resp_json = response.json()
+                        break
+                    except httpx.HTTPError as e:
+                        logging.warning(f"Could not reach {lang}.wikipedia.org for mentions: {e}")
+                        return all_titles
 
-        data = response.json()
-        entities = data.get("entities", {})
-        entity = entities.get(q_id, {})
-        sitelinks = entity.get("sitelinks", {})
+            batch = [item["title"] for item in resp_json.get("query", {}).get("search", [])]
+            all_titles.extend(batch)
 
-        urls = {}
-        for site, link_data in sitelinks.items():
-            site_url = link_data.get("url", "")
-            if "wikipedia.org" in site_url:
-                parsed_url = urlparse(site_url)
-                lang = parsed_url.netloc.split('.')[0]
-                urls[lang] = site_url
-        return urls
+            if "continue" not in resp_json:
+                break
+            data.update(resp_json["continue"])
+
+    return all_titles[:max_total]
 
 
-async def scrape_single_wikipedia_page(url: str, language: str) -> list[dict]:
-    parsed_url = urlparse(url)
+# ---------------------------------------------------------------------------
+# Per-page scraping
+# ---------------------------------------------------------------------------
 
-    domain = parsed_url.netloc
-    title = parsed_url.path.split('/')[-1]
-    raw_url = f"https://{domain}/w/index.php?title={title}&action=raw"
+async def _fetch_and_parse_multiple_mentions(
+        lang: str, candidate_title: str, targets: list[dict]
+) -> list[dict]:
+    domain = f"{lang}.wikipedia.org"
+    encoded_title = urllib.parse.quote(candidate_title)
+    raw_url = f"https://{domain}/w/index.php?title={encoded_title}&action=raw"
     headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
 
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        response = await client.get(raw_url)
-        response.raise_for_status()
-        wikitext = response.text
+    try:
+        async with _FETCH_SEMAPHORE:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+                resp = await client.get(raw_url)
+                resp.raise_for_status()
+                wikitext = resp.text
+    except Exception as e:
+        logging.warning(f"Failed to fetch candidate '{candidate_title}' ({lang}): {e}")
+        return []
 
+    extracted: list[dict] = []
     wikicode = mwparserfromhell.parse(wikitext)
     tags = wikicode.filter_tags(matches=lambda node: node.tag == "ref")
-    extracted_refs = []
 
     for tag in tags:
-        raw_text = str(tag.contents).strip() if tag.contents else ""
-        if not raw_text:
+        tag_text = str(tag.contents).strip() if tag.contents else ""
+        if not tag_text:
             continue
 
-        ref_data = {
-            "raw_text": raw_text,
-            "context_text": extract_context(wikitext, str(tag)),
-            "ref_type": "unknown",
-            "doi": None,
-            "pmid": None,
-            "arxiv": None,
-            "q_id": None,
-            "language": language,
-            "source_url": url
-        }
-
         templates = tag.contents.filter_templates() if tag.contents else []
+        ref_type = "text_mention"
+        ref_q_id, ref_doi, ref_pmid, ref_arxiv = None, None, None, None
+
         for tpl in templates:
-            ref_data["ref_type"] = tpl.name.strip().lower()[:50]
+            tpl_name = str(tpl.name).strip().lower()[:50]
+            if "cite" in tpl_name or "citation" in tpl_name or "literatur" in tpl_name:
+                ref_type = tpl_name
 
-            if ref_data["ref_type"] == "cite q" and tpl.has(1):
-                ref_data["q_id"] = str(tpl.get(1).value).strip()
+            # Iterate through all parameters and lowercase the names to avoid DOI vs doi issues
+            for param in tpl.params:
+                p_name = str(param.name).strip().lower()
 
-            if tpl.has("doi"):
-                ref_data["doi"] = str(tpl.get("doi").value).strip()
-            if tpl.has("pmid"):
-                ref_data["pmid"] = str(tpl.get("pmid").value).strip()
-            if tpl.has("arxiv"):
-                ref_data["arxiv"] = str(tpl.get("arxiv").value).strip()
+                if p_name == "doi":
+                    ref_doi = str(param.value).strip()
+                elif p_name == "pmid":
+                    ref_pmid = str(param.value).strip()
+                elif p_name == "arxiv":
+                    ref_arxiv = str(param.value).strip()
+                elif p_name == "q" or (tpl_name == "cite q" and p_name == "1"):
+                    ref_q_id = str(param.value).strip().upper()
 
-        extracted_refs.append(ref_data)
+        # 2. Check the parameters against our target works
+        matched_targets = {}
+        for t in targets:
+            match = False
 
-    return extracted_refs
+            # Safely extract and normalize target identifiers from QLever
+            t_qid = t["q_id"].strip().upper()
+            t_doi = t.get("doi").strip().lower() if t.get("doi") else None
+            t_pmid = t.get("pmid").strip() if t.get("pmid") else None
+            t_arxiv = t.get("arxiv").strip().lower() if t.get("arxiv") else None
 
+            # Safely normalize the extracted Wikipedia reference identifiers
+            r_doi = ref_doi.strip().lower() if ref_doi else None
+            r_pmid = ref_pmid.strip() if ref_pmid else None
+            r_arxiv = ref_arxiv.strip().lower() if ref_arxiv else None
+            r_qid = ref_q_id.strip().upper() if ref_q_id else None
+
+            # Direct matches
+            if r_qid and t_qid == r_qid:
+                match = True
+            elif r_doi and t_doi and t_doi == r_doi:
+                match = True
+            elif r_pmid and t_pmid and t_pmid == r_pmid:
+                match = True
+            elif r_arxiv and t_arxiv and t_arxiv == r_arxiv:
+                match = True
+
+            # Fallback matches (in case it was written in plain text instead of template parameters)
+            elif t_qid in tag_text.upper():
+                match = True
+            elif t_doi and t_doi in tag_text.lower():
+                match = True
+            elif t_pmid and t_pmid in tag_text:
+                match = True
+
+            if match:
+                matched_targets[t["q_id"]] = t
+
+
+        if not matched_targets:
+            continue
+
+        context_txt = extract_context(wikitext, str(tag))
+
+        for target in matched_targets.values():
+            ref_data = {
+                "raw_text": tag_text,
+                "context_text": context_txt,
+                "ref_type": ref_type,
+                "ref_name": target.get("label", ""),
+                "doi": ref_doi,
+                "pmid": ref_pmid,
+                "arxiv": ref_arxiv,
+                "q_id": target["q_id"],
+                "language": lang,
+                "source_url": f"https://{domain}/wiki/{candidate_title.replace(" ","_")}",
+            }
+            extracted.append(ref_data)
+
+    return extracted
+
+
+async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]:
+    candidate_titles = set()
+
+    # 1. Flatten all identifiers into a single list of search terms
+    # We force everything that is case-insensitive (DOIs, arXivs) into lowercase here.
+    search_terms = []
+    for t in targets:
+        if t.get("q_id"):
+            search_terms.append(t["q_id"])
+        if t.get("doi"):
+            search_terms.append(f'"{t["doi"].strip().lower()}"')
+        if t.get("pmid"):
+            search_terms.append(t["pmid"].strip())
+        if t.get("arxiv"):
+            search_terms.append(f'"{t["arxiv"].strip().lower()}"')
+
+    # 2. Wikipedia's CirrusSearch has a strict limit of 300 characters per query.
+    # We dynamically chunk our terms so no single "OR" string exceeds 250 characters.
+    queries = []
+    current_chunk = []
+    current_len = 0
+
+    for term in search_terms:
+        # Calculate added length (+4 accounts for the " OR " joiner)
+        added_len = len(term) if not current_chunk else len(term) + 4
+
+        if current_len + added_len > 250 and current_chunk:
+            queries.append(" OR ".join(current_chunk))
+            current_chunk = [term]
+            current_len = len(term)
+        else:
+            current_chunk.append(term)
+            current_len += added_len
+
+    if current_chunk:
+        queries.append(" OR ".join(current_chunk))
+
+    # 3. Execute all dynamically sized search queries
+    for query_str in queries:
+        if not query_str:
+            continue
+        mentions = await find_mentions_via_search_query(lang, query_str)
+        candidate_titles.update(mentions)
+
+    if not candidate_titles:
+        return []
+
+    # 4. Fetch the candidate articles and parse them
+    tasks = [
+        _fetch_and_parse_multiple_mentions(lang, title, targets)
+        for title in candidate_titles
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    extracted: list[dict] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logging.warning(f"Batched mention parse failed ({lang}): {result}")
+        else:
+            extracted.extend(result)
+
+    return extracted
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 async def scrape_all_languages_for_qid(q_id: str) -> dict:
     q_id = q_id.strip().upper()
-    sitelinks = await get_sitelinks_from_qid(q_id)
 
-    # BUG FIX: Removed the `raise ValueError` exception here.
-    # If a Q-ID has no direct article, it will simply skip the direct scraping
-    # and move on to searching for mentions.
+    # Step 1: Network calls
+    sitelinks, entity_context = await asyncio.gather(
+        get_sitelinks_from_qid(q_id),
+        get_entity_context(q_id),
+    )
 
-    all_references = []
+    # Note: We completely removed the direct page scraping here.
+    # The scraper now strictly hunts for references to the QID / works.
 
-    # 1. Scrape direct references from the entity's own Wikipedia pages
-    for lang, url in sitelinks.items():
-        try:
-            refs = await scrape_single_wikipedia_page(url, lang)
-            all_references.extend(refs)
-        except Exception as e:
-            logging.warning(f"Failed to scrape {url} ({lang}): {e}")
+    all_references: list[dict] = []
+    targets_by_lang = {}
+    works_targets = []
 
-    # 2. Scrape mentions from other articles using localized Wikidata labels
-    labels = await get_wikidata_labels(q_id)
+    primary_label = ""
+    if entity_context.get("labels"):
+        en_label = next((l["title"] for l in entity_context["labels"] if l["lang"] == "en"), None)
+        primary_label = en_label if en_label else entity_context["labels"][0]["title"]
 
-    for label_data in labels:
-        lang = label_data["lang"]
-        label = label_data["title"]
+    # Target 1: The entity itself
+    works_targets.append({
+        "q_id": q_id,
+        "label": primary_label,
+        "doi": None,
+        "pmid": None,
+        "arxiv": None
+    })
 
-        mentions = await find_mentions_via_search(lang, label)
+    # Target 2+: The entity's works
+    for work in entity_context["works"]:
+        works_targets.append({
+            "q_id": work["work_qid"],
+            "label": work.get("label", ""),
+            "doi": work.get("doi"),
+            "pmid": work.get("pmid"),
+            "arxiv": work.get("arxiv")
+        })
 
-        for mention_title in mentions:
-            try:
-                domain = f"{lang}.wikipedia.org"
-                encoded_title = urllib.parse.quote(mention_title)
-                raw_url = f"https://{domain}/w/index.php?title={encoded_title}&action=raw"
-                headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
+    if works_targets:
+        # Base list to always search
+        base_langs = {"en", "de", "da", "fr", "es", "sv", "no", "nl"}
 
-                async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-                    resp = await client.get(raw_url)
-                    resp.raise_for_status()
-                    wikitext = resp.text
+        # Add any languages where the person actually has a biography
+        if sitelinks:
+            base_langs.update(sitelinks.keys())
 
-                # Extract context directly from the raw wikitext
-                context = extract_text_context(wikitext, label)
+        langs_to_search = list(base_langs)
 
-                if context:
-                    all_references.append({
-                        "raw_text": label,
-                        "context_text": context,
-                        "ref_type": "text_mention",
-                        "doi": None,
-                        "pmid": None,
-                        "arxiv": None,
-                        "q_id": q_id,
-                        "language": lang,
-                        "source_url": f"https://{domain}/wiki/{encoded_title}"
-                    })
-            except Exception as e:
-                logging.warning(f"Failed to scrape mention '{mention_title}' ({lang}): {e}")
+        for lang in langs_to_search:
+            targets_by_lang[lang] = works_targets
+
+
+    mention_tasks = []
+    for lang, targets in targets_by_lang.items():
+        mention_tasks.append(_scrape_mentions_batched(lang, targets))
+
+    if mention_tasks:
+        mention_results = await asyncio.gather(*mention_tasks, return_exceptions=True)
+        for result in mention_results:
+            if isinstance(result, Exception):
+                logging.warning(f"Batched scraping task failed: {result}")
+            else:
+                all_references.extend(result)
 
     return {
         "q_id": q_id,
+        "name": primary_label,
         "references": all_references
     }
-
-
-def extract_text_context(text: str, search_term: str, window: int = 200) -> str:
-    """Finds a plain text search term and extracts the surrounding context window."""
-    pos = text.find(search_term)
-    if pos == -1:
-        # Fallback to case-insensitive match
-        pos = text.lower().find(search_term.lower())
-        if pos == -1:
-            return ""
-
-    start = max(0, pos - window)
-    end = min(len(text), pos + len(search_term) + window)
-    return text[start:end].strip()
-
-
-async def find_mentions_via_search(lang: str, title: str, limit: int = 5) -> list[str]:
-    """Searches a specific language Wikipedia for mentions of a title."""
-    endpoint = f"https://{lang}.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "list": "search",
-        "srsearch": f'"{title}"',
-        "srlimit": str(limit),  # Kept low to avoid massive scraping delays
-        "format": "json"
-    }
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
-
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        try:
-            response = await client.get(endpoint, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return [item["title"] for item in data.get("query", {}).get("search", [])]
-        except Exception as e:
-            logging.warning(f"Could not reach {lang}.wikipedia.org for mentions: {e}")
-            return []

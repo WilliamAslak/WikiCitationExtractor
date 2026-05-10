@@ -9,6 +9,7 @@ class Article(Base):
 
     # q_id is the primary identifier for the entity
     q_id = Column(String(50), primary_key=True, index=True)
+    name = Column(String(50), nullable=False)
     references = relationship("Reference", back_populates="article", cascade="all, delete-orphan")
 
 
@@ -25,6 +26,7 @@ class Reference(Base):
     raw_text = Column(Text, nullable=False)
     context_text = Column(Text, nullable=True)
     ref_type = Column(String(50))
+    ref_name = Column(Text, nullable=True)
     doi = Column(String(100), index=True)
     pmid = Column(String(100), index=True)
     arxiv = Column(String(100), index=True)
