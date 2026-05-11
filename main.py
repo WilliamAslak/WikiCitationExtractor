@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import traceback
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
@@ -15,7 +16,7 @@ from qlever import (
     resolve_references_batch,
     get_author_works,
     get_citations_to_work,
-    get_citations_for_author,
+    get_citations_for_author, get_female_dtu_researchers,
 )
 from config import settings
 
@@ -42,6 +43,21 @@ async def get_db():
 async def health_check():
     return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to the Wiki Citation Extractor API",
+        "endpoints": {
+            "/ok/": "Health check to verify the API is running.",
+            "/scrape/{q_id}/": "Triggers a full Wikipedia scrape and database sync for a specific Wikidata Q-ID.",
+            "/database/dump/": "Returns a summary of all articles currently stored in the local database.",
+            "/database/{q_id}/": "Returns the complete stored reference data for a specific Q-ID.",
+            "/stats/": "Provides database statistics of 'cite q' template usage.",
+            "/author/{q_id}/": "Fetches all works by an author from Wikidata and checks if they exist in our local references.",
+            "/referenced/{q_id}/": "Finds where a specific entity (author or work) is cited and cross-references with our local database.",
+            "/example/1/": "Fetches a list of the most wikipedia referenced female employees of DTU"
+        }
+    }
 
 async def sync_article_by_qid(q_id: str, db: AsyncSession):
     q_id = q_id.strip().upper()
@@ -340,4 +356,67 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
         "resolved_as": entity_type,
         "total_citations": len(combined_citations),
         "citations": combined_citations,
+    }
+
+
+@app.get("/example/1/")
+async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db)):
+    """
+    Finds all female researchers at DTU. Checks the local database for their citations.
+    If missing, scrapes Wikipedia and saves to DB continually.
+    Prints progress to the console and resumes where it left off if interrupted.
+    """
+    # Fetch all researchers by allowing the default 10000 limit
+    researchers = await get_female_dtu_researchers()
+    total_researchers = len(researchers)
+
+    #print(f"\n--- Starting bulk scrape of {total_researchers} female DTU researchers ---")
+
+    results = []
+    for index, researcher in enumerate(researchers):
+        q_id = researcher["q_id"]
+        researcher_name = researcher["name"]
+
+        # Calculate progress stats
+        current_step = index + 1
+        percent_complete = (current_step / total_researchers) * 100
+        items_left = total_researchers - current_step
+
+        stmt = select(Article).options(selectinload(Article.references)).where(Article.q_id == q_id)
+        result = await db.execute(stmt)
+        article = result.scalars().first()
+
+        if article:
+            #print(f"[{current_step}/{total_researchers}] {q_id} ({researcher_name}) already in DB. Skipping.")
+            pass
+        else:
+            #print(f"[{current_step}/{total_researchers}] Scraping {q_id} ({researcher_name})...", end=" ", flush=True)
+            try:
+                # Scrapes Wikipedia and immediately commits to the database
+                await sync_article_by_qid(q_id, db)
+
+                result = await db.execute(stmt)
+                article = result.scalars().first()
+                #print("Done.")
+            except Exception as e:
+                logging.error(f"Failed! Error: {e}")
+
+        #print(f" ---> Progress: {percent_complete:.1f}% complete. ({items_left} remaining)")
+
+        ref_count = len(article.references) if article else 0
+
+        results.append({
+            "q_id": q_id,
+            "name": article.name if article else researcher_name,
+            "reference_count": ref_count
+        })
+
+    #print("--- Bulk scrape finished ---\n")
+
+    results.sort(key=lambda x: x["reference_count"], reverse=True)
+
+    return {
+        "query": "Most referenced female researchers at DTU",
+        "total_processed": total_researchers,
+        "results": results
     }

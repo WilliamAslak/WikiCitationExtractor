@@ -140,18 +140,24 @@ async def _fetch_and_parse_multiple_mentions(
         lang: str, candidate_title: str, targets: list[dict]
 ) -> list[dict]:
     domain = f"{lang}.wikipedia.org"
-    encoded_title = urllib.parse.quote(candidate_title)
+
+    # Safely format the title for the Wikipedia API by replacing spaces with underscores
+    safe_title = candidate_title.replace(" ", "_")
+    encoded_title = urllib.parse.quote(safe_title)
+
     raw_url = f"https://{domain}/w/index.php?title={encoded_title}&action=raw"
     headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
 
+    #print("fetching:",candidate_title)
+
     try:
         async with _FETCH_SEMAPHORE:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30.0) as client:
                 resp = await client.get(raw_url)
                 resp.raise_for_status()
                 wikitext = resp.text
     except Exception as e:
-        logging.warning(f"Failed to fetch candidate '{candidate_title}' ({lang}): {e}")
+        logging.warning(f"Failed to fetch candidate '{candidate_title}' ({lang}): {repr(e)}")
         return []
 
     extracted: list[dict] = []
@@ -172,7 +178,6 @@ async def _fetch_and_parse_multiple_mentions(
             if "cite" in tpl_name or "citation" in tpl_name or "literatur" in tpl_name:
                 ref_type = tpl_name
 
-            # Iterate through all parameters and lowercase the names to avoid DOI vs doi issues
             for param in tpl.params:
                 p_name = str(param.name).strip().lower()
 
@@ -185,24 +190,21 @@ async def _fetch_and_parse_multiple_mentions(
                 elif p_name == "q" or (tpl_name == "cite q" and p_name == "1"):
                     ref_q_id = str(param.value).strip().upper()
 
-        # 2. Check the parameters against our target works
+
         matched_targets = {}
         for t in targets:
             match = False
 
-            # Safely extract and normalize target identifiers from QLever
             t_qid = t["q_id"].strip().upper()
             t_doi = t.get("doi").strip().lower() if t.get("doi") else None
             t_pmid = t.get("pmid").strip() if t.get("pmid") else None
             t_arxiv = t.get("arxiv").strip().lower() if t.get("arxiv") else None
 
-            # Safely normalize the extracted Wikipedia reference identifiers
             r_doi = ref_doi.strip().lower() if ref_doi else None
             r_pmid = ref_pmid.strip() if ref_pmid else None
             r_arxiv = ref_arxiv.strip().lower() if ref_arxiv else None
             r_qid = ref_q_id.strip().upper() if ref_q_id else None
 
-            # Direct matches
             if r_qid and t_qid == r_qid:
                 match = True
             elif r_doi and t_doi and t_doi == r_doi:
@@ -211,13 +213,9 @@ async def _fetch_and_parse_multiple_mentions(
                 match = True
             elif r_arxiv and t_arxiv and t_arxiv == r_arxiv:
                 match = True
-
-            # Fallback matches (in case it was written in plain text instead of template parameters)
             elif t_qid in tag_text.upper():
                 match = True
             elif t_doi and t_doi in tag_text.lower():
-                match = True
-            elif t_pmid and t_pmid in tag_text:
                 match = True
 
             if match:
@@ -240,12 +238,11 @@ async def _fetch_and_parse_multiple_mentions(
                 "arxiv": ref_arxiv,
                 "q_id": target["q_id"],
                 "language": lang,
-                "source_url": f"https://{domain}/wiki/{candidate_title.replace(" ","_")}",
+                "source_url": f"https://{domain}/wiki/{candidate_title.replace(' ', '_')}",
             }
             extracted.append(ref_data)
 
     return extracted
-
 
 async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]:
     candidate_titles = set()

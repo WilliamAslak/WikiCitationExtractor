@@ -10,7 +10,7 @@ async def execute_sparql(query: str) -> dict:
         "Accept": "application/sparql-results+json",
         "User-Agent": f"{settings.bot_name}/{settings.bot_version} (Contact: {settings.contact_email})"
     }
-    print("executing query:\n", query)
+    #print("executing query:\n", query)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
@@ -23,10 +23,10 @@ async def execute_sparql(query: str) -> dict:
             return response.json()
         except httpx.HTTPStatusError as e:
             logging.error(f"QLever HTTP {e.response.status_code} Error: {e.response.text}")
-            return {}
+            raise e
         except Exception as e:
             logging.error(f"QLever connection failed: {repr(e)}")
-            return {}
+            raise e
 
 
 async def resolve_references_batch(
@@ -104,6 +104,7 @@ async def get_entity_context(q_id: str) -> dict:
       {{
         BIND("label" AS ?resultType)
         wd:{q_id} rdfs:label ?label .
+        FILTER(LANG(?label) = "en")
         BIND(LANG(?label) AS ?lang)
       }} UNION {{
         BIND("work" AS ?resultType)
@@ -240,3 +241,51 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
                 "original_work_label": row.get("workLabel", {}).get("value", "Unknown Label"),
             })
     return citations
+
+
+async def get_female_dtu_researchers(limit: int = 10000) -> list[dict]:
+    """
+    Queries Wikidata for female (Q6581072) individuals whose employer (P108)
+    is currently the Technical University of Denmark (Q211115).
+    Filters out past employees by checking the 'end time' qualifier (P582).
+    """
+    query = f"""
+    PREFIX p: <http://www.wikidata.org/prop/>
+    PREFIX ps: <http://www.wikidata.org/prop/statement/>
+    PREFIX pq: <http://www.wikidata.org/prop/qualifier/>
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+    SELECT DISTINCT ?person ?personLabel WHERE {{
+      # Use p: to get the specific employment statement node
+      ?person p:P108 ?employmentStatement .
+
+      # Use ps: to verify the statement is specifically for DTU
+      ?employmentStatement ps:P108 wd:Q1269766 .
+
+      # Must be female
+      ?person wdt:P21 wd:Q6581072 .
+
+      # Attempt to get the end time qualifier from the employment statement
+      OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
+
+      # Keep if there is no end time OR if the end time is in the future
+      FILTER (!BOUND(?endTime) || ?endTime >= NOW())
+
+      OPTIONAL {{ ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en") }}
+    }} LIMIT {limit}
+    """
+    data = await execute_sparql(query)
+    results = data.get("results", {}).get("bindings", [])
+
+    researchers = []
+    for row in results:
+        person_uri = row.get("person", {}).get("value", "")
+        q_id = person_uri.split("/")[-1] if person_uri else None
+        if q_id:
+            researchers.append({
+                "q_id": q_id,
+                "name": row.get("personLabel", {}).get("value", "Unknown Name")
+            })
+    return researchers
