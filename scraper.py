@@ -15,26 +15,33 @@ _FETCH_SEMAPHORE = asyncio.Semaphore(10)
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
+import re
 def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
     pos = wikitext.find(tag_str)
     if pos == -1:
         return ""
 
-    start = max(0, pos - window)
+    # Grab a larger initial chunk to account for very long preceding references
+    search_window = window + 2000
+    start = max(0, pos - search_window)
     left_text = wikitext[start:pos]
 
-    last_ref_close = left_text.rfind("</ref>")
-    if last_ref_close != -1:
-        start += last_ref_close + 6
-    else:
-        last_ref_open = left_text.rfind("<ref")
-        if last_ref_open != -1:
-            close_pos = left_text.find("/>", last_ref_open)
-            if close_pos != -1:
-                start += close_pos + 2
+    # Stop at the most recent linebreak
+    last_newline = left_text.rfind("\n")
+    if last_newline != -1:
+        left_text = left_text[last_newline + 1:]
 
-    return wikitext[start:pos].strip()
+    # Remove all complete <ref>...</ref> tags
+    left_text = re.sub(r'<ref[^>]*>.*?</ref>', '', left_text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Remove all self-closing <ref ... /> tags
+    left_text = re.sub(r'<ref[^>]*/>', '', left_text, flags=re.IGNORECASE)
+
+    # Now take the final `window` characters of the cleaned text
+    if len(left_text) > window:
+        left_text = left_text[-window:]
+
+    return left_text.strip()
 
 
 def normalize_lang_code(lang: str) -> str | None:

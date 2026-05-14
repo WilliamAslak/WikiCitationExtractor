@@ -49,6 +49,7 @@ async def root():
         "message": "Welcome to the Wiki Citation Extractor API",
         "endpoints": {
             "/ok/": "Health check to verify the API is running.",
+            "/refresh/": "Triggers a scrape of each item in the database.",
             "/scrape/{q_id}/": "Triggers a full Wikipedia scrape and database sync for a specific Wikidata Q-ID.",
             "/database/dump/": "Returns a summary of all articles currently stored in the local database.",
             "/database/{q_id}/": "Returns the complete stored reference data for a specific Q-ID.",
@@ -419,4 +420,42 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
         "query": "Most referenced female researchers at DTU",
         "total_processed": total_researchers,
         "results": results
+    }
+
+@app.get("/refresh/")
+async def refresh_all_articles(db: AsyncSession = Depends(get_db)):
+    """
+    Iterates through all articles currently in the database and re-scrapes them
+    to update their references.
+    """
+    # Fetch all existing Q-IDs from the database
+    stmt = select(Article.q_id)
+    result = await db.execute(stmt)
+    all_qids = result.scalars().all()
+
+    total_articles = len(all_qids)
+    results = []
+
+    for index, q_id in enumerate(all_qids):
+        try:
+            # We reuse the exact same logic used by the individual scrape endpoint
+            sync_result = await sync_article_by_qid(q_id, db)
+            results.append({
+                "q_id": q_id,
+                "status": "success",
+                "new_references": sync_result["new_references_added"],
+                "updated_references": sync_result["existing_references_updated"]
+            })
+        except Exception as e:
+            logging.error(f"Failed to refresh {q_id}: {e}")
+            results.append({
+                "q_id": q_id,
+                "status": "failed",
+                "error": str(e)
+            })
+
+    return {
+        "message": "Database refresh complete.",
+        "total_processed": total_articles,
+        "details": results
     }

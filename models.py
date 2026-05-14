@@ -9,7 +9,7 @@ class Article(Base):
 
     # q_id is the primary identifier for the entity
     q_id = Column(String(50), primary_key=True, index=True)
-    name = Column(String(50), nullable=False)
+    name = Column(Text, nullable=False)
     references = relationship("Reference", back_populates="article", cascade="all, delete-orphan")
 
 
