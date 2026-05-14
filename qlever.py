@@ -94,7 +94,7 @@ async def resolve_references_batch(
 
 async def get_entity_context(q_id: str) -> dict:
     if not q_id:
-        return {"labels": [], "works": []}
+        return {"labels": [], "works": [], "doi": None, "pmid": None, "arxiv": None}
 
     query = f"""
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
@@ -102,10 +102,13 @@ async def get_entity_context(q_id: str) -> dict:
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?resultType ?lang ?label ?work ?workLabel ?doi ?pmid ?arxiv WHERE {{
       {{
-        BIND("label" AS ?resultType)
+        BIND("entity" AS ?resultType)
         wd:{q_id} rdfs:label ?label .
         FILTER(LANG(?label) = "en")
         BIND(LANG(?label) AS ?lang)
+        OPTIONAL {{ wd:{q_id} wdt:P356 ?doi . }}
+        OPTIONAL {{ wd:{q_id} wdt:P698 ?pmid . }}
+        OPTIONAL {{ wd:{q_id} wdt:P818 ?arxiv . }}
       }} UNION {{
         BIND("work" AS ?resultType)
         ?work wdt:P50 wd:{q_id} .
@@ -123,14 +126,26 @@ async def get_entity_context(q_id: str) -> dict:
     works: list[dict] = []
     seen_work_qids: set[str] = set()
 
+    entity_doi = None
+    entity_pmid = None
+    entity_arxiv = None
+
     for row in results:
         result_type = row.get("resultType", {}).get("value")
 
-        if result_type == "label":
+        if result_type == "entity":
             lang_code = row.get("lang", {}).get("value")
             label_val = row.get("label", {}).get("value")
             if lang_code and label_val:
                 labels.append({"lang": lang_code, "title": label_val})
+
+            # Grab identifiers for the primary entity itself
+            if row.get("doi") and not entity_doi:
+                entity_doi = row.get("doi").get("value")
+            if row.get("pmid") and not entity_pmid:
+                entity_pmid = row.get("pmid").get("value")
+            if row.get("arxiv") and not entity_arxiv:
+                entity_arxiv = row.get("arxiv").get("value")
 
         elif result_type == "work":
             work_uri = row.get("work", {}).get("value", "")
@@ -146,8 +161,13 @@ async def get_entity_context(q_id: str) -> dict:
                     "arxiv": row.get("arxiv", {}).get("value"),
                 })
 
-    return {"labels": labels, "works": works}
-
+    return {
+        "labels": labels,
+        "works": works,
+        "doi": entity_doi,
+        "pmid": entity_pmid,
+        "arxiv": entity_arxiv
+    }
 
 async def get_author_works(author_qid: str) -> list[dict]:
     if not author_qid:

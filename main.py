@@ -209,9 +209,10 @@ async def dump_entire_database(db: AsyncSession = Depends(get_db)):
 
 @app.get("/database/{q_id}/")
 async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
-    """Returns a complete nested dump of a specific article. Strictly local DB only."""
+    """Returns a complete dump of an entity, or finds where a work was referenced."""
     q_id = q_id.strip().upper()
 
+    # 1. First, check if this Q-ID is a primary scraped entity (like an Author)
     stmt = (
         select(Article)
         .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
@@ -220,34 +221,62 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     article = result.scalars().first()
 
-    if not article:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Q-ID {q_id} not found in local database. Please run /scrape/{q_id}/ first.",
-        )
+    if article:
+        return {
+            "q_id": article.q_id,
+            "name": article.name,
+            "record_type": "primary_entity",
+            "references": [
+                {
+                    "id": ref.id,
+                    "language": ref.language,
+                    "source_url": ref.source_url,
+                    "raw_text": ref.raw_text,
+                    "context_text": ref.context_text,
+                    "ref_type": ref.ref_type,
+                    "doi": ref.doi,
+                    "pmid": ref.pmid,
+                    "arxiv": ref.arxiv,
+                    "q_id": ref.wikidata_mapping.q_id if ref.wikidata_mapping else None,
+                }
+                for ref in article.references
+            ],
+        }
 
-    article_data = {
-        "q_id": article.q_id,
-        "name": article.name,
-        "references": [
-            {
-                "id": ref.id,
-                "language": ref.language,
-                "source_url": ref.source_url,
-                "raw_text": ref.raw_text,
-                "context_text": ref.context_text,
-                "ref_type": ref.ref_type,
-                "ref_name": ref.ref_name,
-                "doi": ref.doi,
-                "pmid": ref.pmid,
-                "arxiv": ref.arxiv,
-                "q_id": ref.wikidata_mapping.q_id if ref.wikidata_mapping else None,
-            }
-            for ref in article.references
-        ],
-    }
-    return article_data
+    # 2. If not found as a primary entity, check if it exists as a referenced work
+    stmt_refs = (
+        select(Reference)
+        .join(WikidataMapping)
+        .where(WikidataMapping.q_id == q_id)
+        .options(selectinload(Reference.article))
+    )
+    result_refs = await db.execute(stmt_refs)
+    references = result_refs.scalars().all()
 
+    if references:
+        return {
+            "q_id": q_id,
+            "record_type": "referenced_work",
+            "message": "This entity was found as a reference within other scraped entities.",
+            "total_mentions": len(references),
+            "mentions": [
+                {
+                    "reference_id": ref.id,
+                    "scraped_under_entity": ref.article_q_id,
+                    "wikipedia_url": ref.source_url,
+                    "language": ref.language,
+                    "raw_text": ref.raw_text,
+                    "context_text": ref.context_text
+                }
+                for ref in references
+            ]
+        }
+
+    # 3. If it is in neither table, return a 404
+    raise HTTPException(
+        status_code=404,
+        detail=f"Q-ID {q_id} not found as a primary entity or as a referenced work in the local database.",
+    )
 
 @app.get("/stats/")
 async def get_stats(db: AsyncSession = Depends(get_db)):

@@ -4,6 +4,7 @@ import httpx
 import mwparserfromhell
 import urllib
 from urllib.parse import urlparse
+import re
 
 from config import settings
 from qlever import get_entity_context
@@ -15,7 +16,6 @@ _FETCH_SEMAPHORE = asyncio.Semaphore(10)
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-import re
 def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
     pos = wikitext.find(tag_str)
     if pos == -1:
@@ -40,6 +40,11 @@ def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
     # Now take the final `window` characters of the cleaned text
     if len(left_text) > window:
         left_text = left_text[-window:]
+
+        # Find the first space to remove any cut-off word at the beginning
+        first_space = left_text.find(" ")
+        if first_space != -1:
+            left_text = left_text[first_space + 1:]
 
     return left_text.strip()
 
@@ -344,9 +349,9 @@ async def scrape_all_languages_for_qid(q_id: str) -> dict:
     works_targets.append({
         "q_id": q_id,
         "label": primary_label,
-        "doi": None,
-        "pmid": None,
-        "arxiv": None
+        "doi": entity_context.get("doi"),
+        "pmid": entity_context.get("pmid"),
+        "arxiv": entity_context.get("arxiv")
     })
 
     # Target 2+: The entity's works
