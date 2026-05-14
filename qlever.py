@@ -197,6 +197,77 @@ async def get_author_works(author_qid: str) -> list[dict]:
     return works
 
 
+async def get_work_authors(work_qid: str) -> list[dict]:
+    """Fetches the authors for a specific work (article)."""
+    if not work_qid:
+        return []
+
+    query = f"""
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?author ?authorLabel WHERE {{
+      wd:{work_qid.upper()} wdt:P50 ?author .
+      OPTIONAL {{ ?author rdfs:label ?authorLabel . FILTER(LANG(?authorLabel) = "en") }}
+    }} LIMIT 10000
+    """
+    data = await execute_sparql(query)
+    results = data.get("results", {}).get("bindings", [])
+
+    authors = []
+    for row in results:
+        author_uri = row.get("author", {}).get("value", "")
+        author_qid = author_uri.split("/")[-1] if author_uri else None
+        if author_qid:
+            authors.append({
+                "author_qid": author_qid,
+                "label": row.get("authorLabel", {}).get("value", "Unknown Label"),
+            })
+    return authors
+
+
+async def get_entity_classification(q_id: str) -> str:
+    """Determines what kind of entity a Q-ID represents (e.g., person, article, book)."""
+    if not q_id:
+        return "unknown"
+
+    query = f"""
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?type ?typeLabel WHERE {{
+      wd:{q_id.upper()} wdt:P31 ?type .
+      OPTIONAL {{ ?type rdfs:label ?typeLabel . FILTER(LANG(?typeLabel) = "en") }}
+    }} LIMIT 1
+    """
+    try:
+        data = await execute_sparql(query)
+        results = data.get("results", {}).get("bindings", [])
+        if results:
+            row = results[0]
+            type_uri = row.get("type", {}).get("value", "")
+            type_qid = type_uri.split("/")[-1] if type_uri else ""
+            type_label = row.get("typeLabel", {}).get("value", "")
+
+            # Provide clean names for common types
+            if type_qid == "Q5":
+                return "person"
+            if type_qid == "Q13442814":
+                return "scholarly article"
+            if type_qid == "Q571":
+                return "book"
+            if type_qid == "Q732577":
+                return "publication"
+
+            # Fallback to the Wikidata label if available
+            if type_label:
+                return type_label
+            return type_qid
+    except Exception as e:
+        logging.error(f"Failed to get entity classification for {q_id}: {e}")
+
+    return "unknown"
+
 async def get_citations_for_author(author_qid: str) -> list[dict]:
     if not author_qid:
         return []

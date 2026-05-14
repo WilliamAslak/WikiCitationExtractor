@@ -10,13 +10,15 @@ from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 import httpx
 
-from models import Base, Article, Reference, WikidataMapping
+from models import Base, Article, Reference
 from scraper import scrape_all_languages_for_qid
 from qlever import (
     resolve_references_batch,
     get_author_works,
+    get_work_authors,
     get_citations_to_work,
     get_citations_for_author, get_female_dtu_researchers,
+    get_entity_classification
 )
 from config import settings
 
@@ -77,7 +79,7 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
 
     stmt = (
         select(Article)
-        .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
+        .options(selectinload(Article.references))
         .where(Article.q_id == q_id)
     )
 
@@ -149,16 +151,13 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
             ref.context_text = context_text
 
             if ref_q_id:
-                if ref.wikidata_mapping:
-                    ref.wikidata_mapping.q_id = ref_q_id
-                else:
-                    mapping = WikidataMapping(reference_id=ref.id, q_id=ref_q_id)
-                    db.add(mapping)
+                ref.q_id = ref_q_id
 
             updated_refs_count += 1
         else:
             ref = Reference(
                 article_q_id=article.q_id,
+                q_id=ref_q_id,
                 language=language,
                 source_url=ref_data["source_url"],
                 raw_text=raw_text,
@@ -171,11 +170,6 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession):
             )
             db.add(ref)
             await db.flush()
-
-            if ref_q_id:
-                mapping = WikidataMapping(reference_id=ref.id, q_id=ref_q_id)
-                db.add(mapping)
-
             new_refs_count += 1
 
     await db.commit()
@@ -215,7 +209,7 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
     # 1. First, check if this Q-ID is a primary scraped entity (like an Author)
     stmt = (
         select(Article)
-        .options(selectinload(Article.references).selectinload(Reference.wikidata_mapping))
+        .options(selectinload(Article.references))
         .where(Article.q_id == q_id)
     )
     result = await db.execute(stmt)
@@ -225,19 +219,19 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
         return {
             "q_id": article.q_id,
             "name": article.name,
-            "record_type": "primary_entity",
+            "record_type": await get_entity_classification(q_id),
             "references": [
                 {
-                    "id": ref.id,
-                    "language": ref.language,
                     "source_url": ref.source_url,
+                    "language": ref.language,
                     "raw_text": ref.raw_text,
                     "context_text": ref.context_text,
                     "ref_type": ref.ref_type,
+                    "ref_name": ref.ref_name,
                     "doi": ref.doi,
                     "pmid": ref.pmid,
                     "arxiv": ref.arxiv,
-                    "q_id": ref.wikidata_mapping.q_id if ref.wikidata_mapping else None,
+                    "q_id": ref.q_id,
                 }
                 for ref in article.references
             ],
@@ -246,30 +240,37 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
     # 2. If not found as a primary entity, check if it exists as a referenced work
     stmt_refs = (
         select(Reference)
-        .join(WikidataMapping)
-        .where(WikidataMapping.q_id == q_id)
+        .where(Reference.q_id == q_id)
         .options(selectinload(Reference.article))
     )
     result_refs = await db.execute(stmt_refs)
     references = result_refs.scalars().all()
 
     if references:
-        return {
-            "q_id": q_id,
-            "record_type": "referenced_work",
-            "message": "This entity was found as a reference within other scraped entities.",
-            "total_mentions": len(references),
-            "mentions": [
-                {
-                    "reference_id": ref.id,
-                    "scraped_under_entity": ref.article_q_id,
+        grouped_mentions = {}
+        for ref in references:
+            key = (ref.source_url, ref.language, ref.raw_text, ref.context_text)
+
+            if key not in grouped_mentions:
+                grouped_mentions[key] = {
+                    "scraped_under_entities": [ref.article_q_id],
                     "wikipedia_url": ref.source_url,
                     "language": ref.language,
                     "raw_text": ref.raw_text,
-                    "context_text": ref.context_text
+                    "context_text": ref.context_text,
+                    "ref_name": ref.ref_name
                 }
-                for ref in references
-            ]
+            else:
+                if ref.article_q_id not in grouped_mentions[key]["scraped_under_entities"]:
+                    grouped_mentions[key]["scraped_under_entities"].append(ref.article_q_id)
+
+        mentions_list = list(grouped_mentions.values())
+
+        return {
+            "q_id": q_id,
+            "record_type": await get_entity_classification(q_id),
+            "total_mentions": len(mentions_list),
+            "mentions": mentions_list
         }
 
     # 3. If it is in neither table, return a 404
@@ -291,15 +292,24 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
 async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
     q_id = q_id.strip().upper()
     works_data = await get_author_works(q_id)
+
+    if not works_data:
+        authors_data = await get_work_authors(q_id)
+        if authors_data:
+            author_q_ids = {author["label"]: author["author_qid"] for author in authors_data}
+            return {
+                "work_q_id": q_id,
+                "resolved_as": "article",
+                "author_q_ids": author_q_ids
+            }
+
     work_qids = [work["work_qid"] for work in works_data]
 
     local_refs = []
     if work_qids:
         stmt = (
             select(Reference)
-            .join(WikidataMapping)
-            .where(WikidataMapping.q_id.in_(work_qids))
-            .options(selectinload(Reference.wikidata_mapping))
+            .where(Reference.q_id.in_(work_qids))
         )
         result = await db.execute(stmt)
         local_refs = result.scalars().all()
@@ -309,14 +319,13 @@ async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
         work_qid = work["work_qid"]
         matching_local_refs = [
             {
-                "reference_id": ref.id,
                 "raw_text": ref.raw_text,
                 "context_text": ref.context_text,
                 "language": ref.language,
                 "source_url": ref.source_url,
             }
             for ref in local_refs
-            if ref.wikidata_mapping.q_id == work_qid
+            if ref.q_id == work_qid
         ]
         combined_works.append({
             "work_q_id": work_qid,
@@ -327,6 +336,7 @@ async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
 
     return {
         "author_q_id": q_id,
+        "resolved_as": "author",
         "total_works": len(combined_works),
         "works": combined_works,
     }
@@ -350,10 +360,7 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
     local_refs = []
     if citing_qids:
         stmt = (
-            select(Reference)
-            .join(WikidataMapping)
-            .where(WikidataMapping.q_id.in_(citing_qids))
-            .options(selectinload(Reference.wikidata_mapping))
+            select(Reference).where(Reference.q_id.in_(citing_qids))
         )
         result = await db.execute(stmt)
         local_refs = result.scalars().all()
@@ -363,14 +370,13 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
         citing_qid = citation["citing_work_qid"]
         matching_local_refs = [
             {
-                "reference_id": ref.id,
                 "raw_text": ref.raw_text,
                 "context_text": ref.context_text,
-                "language": ref.language,
                 "source_url": ref.source_url,
+                "language": ref.language,
             }
             for ref in local_refs
-            if ref.wikidata_mapping.q_id == citing_qid
+            if ref.q_id == citing_qid
         ]
         combined_citations.append({
             "citing_work_q_id": citing_qid,
@@ -400,27 +406,18 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
     researchers = await get_female_dtu_researchers()
     total_researchers = len(researchers)
 
-    #print(f"\n--- Starting bulk scrape of {total_researchers} female DTU researchers ---")
+    print(f"\n--- Starting bulk scrape of {total_researchers} female DTU researchers ---")
 
     results = []
     for index, researcher in enumerate(researchers):
         q_id = researcher["q_id"]
         researcher_name = researcher["name"]
 
-        # Calculate progress stats
-        current_step = index + 1
-        percent_complete = (current_step / total_researchers) * 100
-        items_left = total_researchers - current_step
-
         stmt = select(Article).options(selectinload(Article.references)).where(Article.q_id == q_id)
         result = await db.execute(stmt)
         article = result.scalars().first()
 
-        if article:
-            #print(f"[{current_step}/{total_researchers}] {q_id} ({researcher_name}) already in DB. Skipping.")
-            pass
-        else:
-            #print(f"[{current_step}/{total_researchers}] Scraping {q_id} ({researcher_name})...", end=" ", flush=True)
+        if not article:
             try:
                 # Scrapes Wikipedia and immediately commits to the database
                 await sync_article_by_qid(q_id, db)
@@ -441,15 +438,19 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
             "reference_count": ref_count
         })
 
-    #print("--- Bulk scrape finished ---\n")
+        if index % 5 == 0:
+            print(f"{total_researchers - index} q_ids left to scrape")
+
+    print("--- Bulk scrape finished ---\n")
 
     results.sort(key=lambda x: x["reference_count"], reverse=True)
 
     return {
         "query": "Most referenced female researchers at DTU",
-        "total_processed": total_researchers,
+        "total_processed": len(results),
         "results": results
     }
+
 
 @app.get("/refresh/")
 async def refresh_all_articles(db: AsyncSession = Depends(get_db)):
@@ -482,6 +483,8 @@ async def refresh_all_articles(db: AsyncSession = Depends(get_db)):
                 "status": "failed",
                 "error": str(e)
             })
+        if index % 5 == 0:
+            print(f"{len(all_qids) - index} q_ids left to scrape")
 
     return {
         "message": "Database refresh complete.",

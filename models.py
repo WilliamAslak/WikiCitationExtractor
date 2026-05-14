@@ -19,7 +19,10 @@ class Reference(Base):
     id = Column(Integer, primary_key=True, index=True)
     article_q_id = Column(String(50), ForeignKey('articles.q_id'), nullable=False)
 
-    # Source tracking moved to the reference level
+    # Added q_id directly to the Reference table
+    q_id = Column(String(50), index=True, nullable=True)
+
+    # Source tracking
     language = Column(String(10), nullable=False)
     source_url = Column(String(500), nullable=False)
 
@@ -32,15 +35,3 @@ class Reference(Base):
     arxiv = Column(String(100), index=True)
 
     article = relationship("Article", back_populates="references")
-    wikidata_mapping = relationship("WikidataMapping", back_populates="reference", uselist=False,
-                                    cascade="all, delete-orphan")
-
-
-class WikidataMapping(Base):
-    __tablename__ = 'wikidata_mappings'
-
-    id = Column(Integer, primary_key=True, index=True)
-    reference_id = Column(Integer, ForeignKey('references.id'), nullable=False, unique=True)
-    q_id = Column(String(50), index=True, nullable=False)
-
-    reference = relationship("Reference", back_populates="wikidata_mapping")
