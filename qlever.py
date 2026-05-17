@@ -414,3 +414,49 @@ async def get_female_dtu_researchers(limit: int = 10000) -> list[dict]:
                 "name": row.get("personLabel", {}).get("value", "Unknown Name")
             })
     return researchers
+
+
+async def get_institute_researchers(institute_qid: str, limit: int = 10000) -> list[dict]:
+    """
+    Queries Wikidata for individuals whose employer (P108) is currently the specified institute.
+    Filters out past employees by checking the 'end time' qualifier (P582).
+    """
+    institute_qid = institute_qid.strip().upper()
+
+    query = f"""
+    PREFIX p: <http://www.wikidata.org/prop/>
+    PREFIX ps: <http://www.wikidata.org/prop/statement/>
+    PREFIX pq: <http://www.wikidata.org/prop/qualifier/>
+    PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+    PREFIX wd: <http://www.wikidata.org/entity/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+    SELECT DISTINCT ?person ?personLabel WHERE {{
+      # Use p: to get the specific employment statement node
+      ?person p:P108 ?employmentStatement .
+
+      # Use ps: to verify the statement is specifically for the given institute
+      ?employmentStatement ps:P108 wd:{institute_qid} .
+
+      # Attempt to get the end time qualifier from the employment statement
+      OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
+
+      # Keep if there is no end time OR if the end time is in the future
+      FILTER (!BOUND(?endTime) || ?endTime >= NOW())
+
+      OPTIONAL {{ ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en") }}
+    }} LIMIT {limit}
+    """
+    data = await execute_sparql(query)
+    results = data.get("results", {}).get("bindings", [])
+
+    researchers = []
+    for row in results:
+        person_uri = row.get("person", {}).get("value", "")
+        q_id = person_uri.split("/")[-1] if person_uri else None
+        if q_id:
+            researchers.append({
+                "q_id": q_id,
+                "name": row.get("personLabel", {}).get("value", "Unknown Name")
+            })
+    return researchers

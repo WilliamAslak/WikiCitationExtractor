@@ -22,7 +22,8 @@ from qlever import (
     get_citations_for_author,
     get_female_dtu_researchers,
     get_entity_classification,
-    get_entity_context
+    get_entity_context,
+    get_institute_researchers
 )
 from config import settings
 
@@ -59,7 +60,8 @@ async def root():
             "/stats/": "Provides database statistics of 'cite q' template usage.",
             "/author/{q_id}/": "Fetches all works by an author from Wikidata and checks if they exist in our local references.",
             "/referenced/{q_id}/": "Finds where a specific entity (author or work) is cited and cross-references with our local database.",
-            "/example/1/": "Fetches a list of the most wikipedia referenced female employees of DTU"
+            "/example/1/": "Fetches a list of the most wikipedia referenced female employees of DTU",
+            "institute/{institute_qid}": "Fetches a list of the most wikipedia referenced employee at given institute"
         }
     }
 
@@ -333,6 +335,9 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
     """Local-only check. Returns the requested entity and aggregates references for any linked works."""
     q_id = q_id.strip().upper()
 
+    if not re.match(r"^Q\d+$", q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
+
     stmt = select(Article).options(selectinload(Article.references)).where(Article.q_id == q_id)
     result = await db.execute(stmt)
     article = result.scalars().first()
@@ -389,6 +394,10 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
 @app.get("/author/{q_id}/")
 async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
     q_id = q_id.strip().upper()
+
+    if not re.match(r"^Q\d+$", q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
+
     works_data = await get_author_works(q_id)
 
     if not works_data:
@@ -440,6 +449,9 @@ async def search_author(q_id: str, db: AsyncSession = Depends(get_db)):
 @app.get("/referenced/{q_id}/")
 async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)):
     q_id = q_id.strip().upper()
+
+    if not re.match(r"^Q\d+$", q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
 
     # Try treating the Q-ID as an Author first
     entity_type = "author"
@@ -519,23 +531,20 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
             stmt = select(Article).options(selectinload(Article.references)).where(Article.q_id == q_id)
             result = await db.execute(stmt)
             article = result.scalars().first()
-
+            ref_count = 0
             if not article:
                 try:
                     # Scrapes Wikipedia and immediately commits to the database
-                    await sync_article_by_qid(q_id, db)
-
+                    scraped = await sync_article_by_qid(q_id, db)
+                    ref_count = scraped["new_references_added"] + scraped["existing_references_updated"]
                     result = await db.execute(stmt)
                     article = result.scalars().first()
                     #print("Done.")
                 except Exception as e:
                     logging.error(f"Failed! Error: {e}")
-
-            if article:
+            else:
                 ref_count = (await db.execute(select(func.count(Reference.id)).where((Reference.article_q_id == q_id) |
                     Reference.article_q_id.in_(select(EntityLink.child_q_id).where(EntityLink.parent_q_id == q_id))))).scalar()
-            else:
-                ref_count = 0
 
             #print(f"scraped {article.q_id}:{article.name} and found {ref_count} reference{"s" if ref_count!=1 else ""}.")
 
@@ -559,3 +568,74 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
         }
     finally:
         active_scrapes.discard("example_1")
+
+
+@app.get("/institute/{institute}/")
+async def example_most_referenced_at_institute(institute: str, db: AsyncSession = Depends(get_db)):
+    """
+    Finds all researchers at the given institute. Checks the local database for their citations.
+    If missing, scrapes Wikipedia and saves to DB continually.
+    Prints progress to the console and resumes where it left off if interrupted.
+    """
+    institute_q_id = institute.strip().upper()
+    if not re.match(r"^Q\d+$", institute_q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
+
+    global active_scrapes
+    if "institute|"+institute.strip().upper() in active_scrapes:
+        raise HTTPException(status_code=409, detail="The institute example scrape is already in progress.")
+
+    active_scrapes.add("institute|"+institute.strip().upper())
+
+    try:
+        researchers = await get_institute_researchers(institute_q_id)
+        total_researchers = len(researchers)
+
+        if total_researchers == 0:
+            return {"message": f"No active researchers found on Wikidata for {institute_q_id}."}
+
+        print(f"\n--- Starting bulk scrape of {total_researchers} researchers at {institute_q_id} ---")
+
+        results = []
+        for index, researcher in enumerate(researchers):
+            q_id = researcher["q_id"]
+            researcher_name = researcher["name"]
+
+            stmt = select(Article).options(selectinload(Article.references)).where(Article.q_id == q_id)
+            result = await db.execute(stmt)
+            article = result.scalars().first()
+            ref_count = 0
+            if not article:
+                try:
+                    # Scrapes Wikipedia and immediately commits to the database
+                    scraped = await sync_article_by_qid(q_id, db)
+                    ref_count = scraped["new_references_added"]+scraped["existing_references_updated"]
+                    result = await db.execute(stmt)
+                    article = result.scalars().first()
+                except Exception as e:
+                    logging.error(f"Failed to scrape {q_id}: {e}")
+            else:
+                ref_count = (await db.execute(select(func.count(Reference.id)).where((Reference.article_q_id == q_id) |
+                    Reference.article_q_id.in_(select(EntityLink.child_q_id).where(EntityLink.parent_q_id == q_id))))).scalar()
+
+
+            results.append({
+                "q_id": q_id,
+                "name": article.name if article else researcher_name,
+                "reference_count": ref_count
+            })
+
+            if index % 5 == 0:
+                print(f"{(max(1,index)/total_researchers)*100:.2f}% complete. ({total_researchers - index} researchers remaining)")
+
+        print("--- Bulk scrape finished ---\n")
+
+        results.sort(key=lambda x: x["reference_count"], reverse=True)
+
+        return {
+            "query": f"Most referenced researchers at {institute_q_id}",
+            "total_processed": len(results),
+            "results": results
+        }
+    finally:
+        active_scrapes.discard("institute|"+institute.strip().upper())
