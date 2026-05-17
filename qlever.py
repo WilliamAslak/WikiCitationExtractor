@@ -1,33 +1,68 @@
 import httpx
 import logging
+import asyncio
 
 from config import settings
 
 
-async def execute_sparql(query: str) -> dict:
-    """Executor for SPARQL queries to QLever."""
+async def execute_sparql(query: str, max_retries: int = 5) -> dict:
+    """Executor for SPARQL queries to QLever with exponential backoff."""
     headers = {
         "Accept": "application/sparql-results+json",
         "User-Agent": f"{settings.bot_name}/{settings.bot_version} (Contact: {settings.contact_email})"
     }
     #print("executing query:\n", query)
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(
-                settings.qlever_url,
-                params={"query": query},
-                headers=headers,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            logging.error(f"QLever HTTP {e.response.status_code} Error: {e.response.text}")
-            raise e
-        except Exception as e:
-            logging.error(f"QLever connection failed: {repr(e)}")
-            raise e
+        retries = 0
+        while True:
+            try:
+                response = await client.get(
+                    settings.qlever_url,
+                    params={"query": query},
+                    headers=headers,
+                    timeout=30.0
+                )
 
+                # Explicitly handle 429 Too Many Requests
+                if response.status_code == 429:
+                    wait = 2 ** retries
+                    logging.warning(f"429 Too Many Requests from QLever. Backing off {wait}s")
+                    await asyncio.sleep(wait)
+                    retries += 1
+                    if retries > max_retries:
+                        response.raise_for_status()
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.TimeoutException as e:
+                wait = 2 ** retries
+                logging.warning(f"QLever Timeout ({type(e)}). Backing off {wait}s")
+                await asyncio.sleep(wait)
+                retries += 1
+                if retries > max_retries:
+                    logging.error(f"QLever connection failed after {max_retries} retries: {repr(e)}")
+                    raise e
+
+            except httpx.HTTPStatusError as e:
+                # Retry on 5xx Server Errors
+                if e.response.status_code >= 500:
+                    wait = 2 ** retries
+                    logging.warning(f"QLever Server Error {e.response.status_code}. Backing off {wait}s")
+                    await asyncio.sleep(wait)
+                    retries += 1
+                    if retries > max_retries:
+                        logging.error(f"QLever HTTP {e.response.status_code} Error: {e.response.text}")
+                        raise e
+                else:
+                    # Fail immediately on 400 Bad Request, etc.
+                    logging.error(f"QLever HTTP {e.response.status_code} Error: {e.response.text}")
+                    raise e
+
+            except Exception as e:
+                logging.error(f"QLever connection failed unexpectedly: {repr(e)}")
+                raise e
 
 async def resolve_references_batch(
         dois: list[str], qids: list[str]
@@ -104,7 +139,6 @@ async def get_entity_context(q_id: str) -> dict:
       {{
         BIND("entity" AS ?resultType)
         wd:{q_id} rdfs:label ?label .
-        FILTER(LANG(?label) = "en")
         BIND(LANG(?label) AS ?lang)
         OPTIONAL {{ wd:{q_id} wdt:P356 ?doi . }}
         OPTIONAL {{ wd:{q_id} wdt:P698 ?pmid . }}

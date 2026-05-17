@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 import re
 
 from config import settings
-from qlever import get_entity_context
 
 _SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 _FETCH_SEMAPHORE = asyncio.Semaphore(10)
@@ -16,10 +15,13 @@ _FETCH_SEMAPHORE = asyncio.Semaphore(10)
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-def extract_context(wikitext: str, tag_str: str, window: int = 200) -> str:
-    pos = wikitext.find(tag_str)
-    if pos == -1:
-        return ""
+def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: int = 200) -> str:
+    # Find the specific nth occurrence of the tag string
+    pos = -1
+    for _ in range(occurrence + 1):
+        pos = wikitext.find(tag_str, pos + 1)
+        if pos == -1:
+            return ""
 
     # Grab a larger initial chunk to account for very long preceding references
     search_window = window + 2000
@@ -62,6 +64,61 @@ def normalize_lang_code(lang: str) -> str | None:
 # Wikidata / Wikipedia API calls
 # ---------------------------------------------------------------------------
 
+async def fetch_with_retry(method: str, url: str, semaphore: asyncio.Semaphore, max_retries: int = 4, params: dict | None = None,
+        data: dict | None = None, timeout: float = 15.0) -> httpx.Response:
+    """Generic HTTP request executor with explicit parameters and backoff."""
+
+    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
+
+    async with semaphore:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+            retries = 0
+            while True:
+                try:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        params=params,
+                        data=data,
+                        timeout=timeout
+                    )
+
+                    if response.status_code == 429:
+                        wait = 2 ** retries
+                        logging.warning(f"429 Too Many Requests from {url}. Backing off {wait}s")
+                        await asyncio.sleep(wait)
+                        retries += 1
+                        if retries > max_retries:
+                            response.raise_for_status()
+                        continue
+
+                    response.raise_for_status()
+                    return response
+
+                except httpx.TimeoutException as e:
+                    wait = 2 ** retries
+                    logging.warning(f"Timeout ({type(e)}) on {url}. Backing off {wait}s")
+                    await asyncio.sleep(wait)
+                    retries += 1
+                    if retries > max_retries:
+                        logging.error(f"Connection failed after {max_retries} retries for {url}")
+                        raise e
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code >= 500:
+                        wait = 2 ** retries
+                        logging.warning(f"Server Error {e.response.status_code} on {url}. Backing off {wait}s")
+                        await asyncio.sleep(wait)
+                        retries += 1
+                        if retries > max_retries:
+                            raise e
+                    else:
+                        raise e
+                except Exception as e:
+                    logging.error(f"Connection failed unexpectedly for {url}: {repr(e)}")
+                    raise e
+
+
 async def get_sitelinks_from_qid(q_id: str) -> dict[str, str]:
     """Used only to know which Wikipedia language editions are highly relevant to search."""
     q_id = q_id.strip().upper()
@@ -72,13 +129,12 @@ async def get_sitelinks_from_qid(q_id: str) -> dict[str, str]:
         "props": "sitelinks/urls",
         "format": "json",
     }
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
 
-    async with _FETCH_SEMAPHORE:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+    try:
+        data = (await fetch_with_retry("GET", url, _FETCH_SEMAPHORE, params=params, timeout=30.0)).json()
+    except Exception as e:
+        logging.error(f"Failed to fetch sitelinks for {q_id}: {e}")
+        return {}
 
     entities = data.get("entities", {})
     entity = entities.get(q_id, {})
@@ -94,11 +150,8 @@ async def get_sitelinks_from_qid(q_id: str) -> dict[str, str]:
     return urls
 
 
-async def find_mentions_via_search_query(
-        lang: str, query_str: str, max_total: int = 50
-) -> list[str]:
+async def find_mentions_via_search_query(lang: str, query_str: str, max_total: int = 50) -> list[str]:
     endpoint = f"https://{lang}.wikipedia.org/w/api.php"
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
     all_titles: list[str] = []
 
     data = {
@@ -110,36 +163,19 @@ async def find_mentions_via_search_query(
         "format": "json",
     }
 
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        while len(all_titles) < max_total:
-            async with _SEARCH_SEMAPHORE:
-                retries = 0
-                while True:
-                    try:
-                        response = await client.post(endpoint, data=data, timeout=15.0)
-                        if response.status_code == 429:
-                            wait = 2 ** retries
-                            logging.warning(
-                                f"429 from {lang}.wikipedia.org search — backing off {wait}s"
-                            )
-                            await asyncio.sleep(wait)
-                            retries += 1
-                            if retries > 4:
-                                return all_titles
-                            continue
-                        response.raise_for_status()
-                        resp_json = response.json()
-                        break
-                    except httpx.HTTPError as e:
-                        logging.warning(f"Could not reach {lang}.wikipedia.org for mentions: {e}")
-                        return all_titles
+    while len(all_titles) < max_total:
+        try:
+            resp_json = (await fetch_with_retry("POST", endpoint, _SEARCH_SEMAPHORE, data=data, timeout=15.0)).json()
+        except Exception as e:
+            logging.warning(f"Could not reach {lang}.wikipedia.org for mentions: {e}")
+            return all_titles
 
-            batch = [item["title"] for item in resp_json.get("query", {}).get("search", [])]
-            all_titles.extend(batch)
+        batch = [item["title"] for item in resp_json.get("query", {}).get("search", [])]
+        all_titles.extend(batch)
 
-            if "continue" not in resp_json:
-                break
-            data.update(resp_json["continue"])
+        if "continue" not in resp_json:
+            break
+        data.update(resp_json["continue"])
 
     return all_titles[:max_total]
 
@@ -148,26 +184,16 @@ async def find_mentions_via_search_query(
 # Per-page scraping
 # ---------------------------------------------------------------------------
 
-async def _fetch_and_parse_multiple_mentions(
-        lang: str, candidate_title: str, targets: list[dict]
-) -> list[dict]:
+async def _fetch_and_parse_multiple_mentions(lang: str, candidate_title: str, targets: list[dict]) -> list[dict]:
     domain = f"{lang}.wikipedia.org"
 
     # Safely format the title for the Wikipedia API by replacing spaces with underscores
-    safe_title = candidate_title.replace(" ", "_")
-    encoded_title = urllib.parse.quote(safe_title)
+    encoded_title = urllib.parse.quote(candidate_title.replace(" ", "_"))
 
     raw_url = f"https://{domain}/w/index.php?title={encoded_title}&action=raw"
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
-
-    #print("fetching:",candidate_title)
 
     try:
-        async with _FETCH_SEMAPHORE:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30.0) as client:
-                resp = await client.get(raw_url)
-                resp.raise_for_status()
-                wikitext = resp.text
+        wikitext = (await fetch_with_retry("GET", raw_url, _FETCH_SEMAPHORE, timeout=30.0)).text
     except Exception as e:
         logging.warning(f"Failed to fetch candidate '{candidate_title}' ({lang}): {repr(e)}")
         return []
@@ -176,7 +202,14 @@ async def _fetch_and_parse_multiple_mentions(
     wikicode = mwparserfromhell.parse(wikitext)
     tags = wikicode.filter_tags(matches=lambda node: node.tag == "ref")
 
+
+    # Handles duplicate <ref> tags in the same article for example:
+    tag_seen_counts = {}
     for tag in tags:
+        tag_raw_str = str(tag)
+        occurrence_index = tag_seen_counts.get(tag_raw_str, 0)
+        tag_seen_counts[tag_raw_str] = occurrence_index + 1
+
         tag_text = str(tag.contents).strip() if tag.contents else ""
         if not tag_text:
             continue
@@ -202,42 +235,31 @@ async def _fetch_and_parse_multiple_mentions(
                 elif p_name == "q" or (tpl_name == "cite q" and p_name == "1"):
                     ref_q_id = str(param.value).strip().upper()
 
+        # Normalizing the parsed reference strings once outside the loop to save processing power
+        r_qid = ref_q_id.strip().upper() if ref_q_id else None
+        r_doi = ref_doi.strip().lower() if ref_doi else None
+        r_pmid = ref_pmid.strip() if ref_pmid else None
+        r_arxiv = ref_arxiv.strip().lower() if ref_arxiv else None
+        #print(r_qid, r_doi, r_pmid, r_arxiv)
 
         matched_targets = {}
         for t in targets:
-            match = False
-
+            # Unpack the target variables
             t_qid = t["q_id"].strip().upper()
-            t_doi = t.get("doi").strip().lower() if t.get("doi") else None
-            t_pmid = t.get("pmid").strip() if t.get("pmid") else None
-            t_arxiv = t.get("arxiv").strip().lower() if t.get("arxiv") else None
+            t_doi = t.get("doi", "").strip().lower() if t.get("doi") else None
+            t_pmid = t.get("pmid", "").strip() if t.get("pmid") else None
+            t_arxiv = t.get("arxiv", "").strip().lower() if t.get("arxiv") else None
 
-            r_doi = ref_doi.strip().lower() if ref_doi else None
-            r_pmid = ref_pmid.strip() if ref_pmid else None
-            r_arxiv = ref_arxiv.strip().lower() if ref_arxiv else None
-            r_qid = ref_q_id.strip().upper() if ref_q_id else None
-
-            if r_qid and t_qid == r_qid:
-                match = True
-            elif r_doi and t_doi and t_doi == r_doi:
-                match = True
-            elif r_pmid and t_pmid and t_pmid == r_pmid:
-                match = True
-            elif r_arxiv and t_arxiv and t_arxiv == r_arxiv:
-                match = True
-            elif t_qid in tag_text.upper():
-                match = True
-            elif t_doi and t_doi in tag_text.lower():
-                match = True
-
-            if match:
+            # Evaluate all match conditions in a single boolean check instead of our previous if else ladder.
+            if ((r_qid and r_qid == t_qid) or (r_doi and r_doi == t_doi) or
+                (r_pmid and r_pmid == t_pmid) or (r_arxiv and r_arxiv == t_arxiv) or
+                (t_qid in tag_text.upper()) or (t_doi and t_doi in tag_text.lower())):
                 matched_targets[t["q_id"]] = t
-
 
         if not matched_targets:
             continue
 
-        context_txt = extract_context(wikitext, str(tag))
+        context_txt = extract_context(wikitext, tag_raw_str, occurrence=occurrence_index)
 
         for target in matched_targets.values():
             ref_data = {
@@ -324,74 +346,29 @@ async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]
 # Main entry point
 # ---------------------------------------------------------------------------
 
-async def scrape_all_languages_for_qid(q_id: str) -> dict:
-    q_id = q_id.strip().upper()
+async def scrape_targets(targets: list[dict], main_qid: str) -> list[dict]:
+    """Takes a pre-filtered list of targets to strictly search Wikipedia for."""
+    if not targets:
+        return []
 
-    # Step 1: Network calls
-    sitelinks, entity_context = await asyncio.gather(
-        get_sitelinks_from_qid(q_id),
-        get_entity_context(q_id),
-    )
+    main_qid = main_qid.strip().upper()
+    sitelinks = await get_sitelinks_from_qid(main_qid)
 
-    # Note: We completely removed the direct page scraping here.
-    # The scraper now strictly hunts for references to the QID / works.
-
-    all_references: list[dict] = []
-    targets_by_lang = {}
-    works_targets = []
-
-    primary_label = ""
-    if entity_context.get("labels"):
-        en_label = next((l["title"] for l in entity_context["labels"] if l["lang"] == "en"), None)
-        primary_label = en_label if en_label else entity_context["labels"][0]["title"]
-
-    # Target 1: The entity itself
-    works_targets.append({
-        "q_id": q_id,
-        "label": primary_label,
-        "doi": entity_context.get("doi"),
-        "pmid": entity_context.get("pmid"),
-        "arxiv": entity_context.get("arxiv")
-    })
-
-    # Target 2+: The entity's works
-    for work in entity_context["works"]:
-        works_targets.append({
-            "q_id": work["work_qid"],
-            "label": work.get("label", ""),
-            "doi": work.get("doi"),
-            "pmid": work.get("pmid"),
-            "arxiv": work.get("arxiv")
-        })
-
-    if works_targets:
-        # Base list to always search
-        base_langs = {"en", "de", "da", "fr", "es", "sv", "no", "nl"}
-
-        # Add any languages where the person actually has a biography
-        if sitelinks:
-            base_langs.update(sitelinks.keys())
-
-        langs_to_search = list(base_langs)
-
-        for lang in langs_to_search:
-            targets_by_lang[lang] = works_targets
-
+    base_langs = {"en", "de", "da", "fr", "es", "sv", "no", "nl"}
+    if sitelinks:
+        base_langs.update(sitelinks.keys())
 
     mention_tasks = []
-    for lang, targets in targets_by_lang.items():
+    for lang in base_langs:
         mention_tasks.append(_scrape_mentions_batched(lang, targets))
 
+    all_references = []
     if mention_tasks:
-        mention_results = await asyncio.gather(*mention_tasks, return_exceptions=True)
-        for result in mention_results:
+        results = await asyncio.gather(*mention_tasks, return_exceptions=True)
+        for result in results:
             if isinstance(result, Exception):
                 logging.warning(f"Batched scraping task failed: {result}")
             else:
                 all_references.extend(result)
 
-    return {
-        "q_id": q_id,
-        "name": primary_label,
-        "references": all_references
-    }
+    return all_references
