@@ -42,6 +42,8 @@ active_scrapes = set()
 
 app = FastAPI(title="Wiki Citation Extractor", lifespan=lifespan)
 
+# Uncomment to only log errors, (primarily to avoid printing each 429 error from wikipedia if it happens)
+#logging.getLogger().setLevel(logging.ERROR)
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -128,9 +130,7 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession, rescrape = False):
         # Allow intentional HTTP exceptions (like a 404) to pass through without printing a crash trace
             raise
         except Exception as e:
-            print("\n--- CRASH IN SCRAPER ---")
-            traceback.print_exc()
-            print("------------------------\n")
+            logging.error(f"Scraper crashed for {q_id}: {e}")
             raise HTTPException(status_code=400, detail=f"Scraping failed: {e}")
 
         # Scraping takes time. If the user refreshed the page, a parallel request
@@ -511,9 +511,6 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
         "citations": combined_citations,
     }
 
-
-from datetime import datetime, timedelta
-
 @app.get("/example/1/")
 async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db)):
     """
@@ -521,14 +518,11 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
     If missing, scrapes Wikipedia and saves to DB continually.
     Prints progress to the console and resumes where it left off if interrupted.
     """
-    big_scrape_start = datetime.now()
-    print("The scrape has begun at ",big_scrape_start)
     global active_scrapes
     if "example_1" in active_scrapes:
         raise HTTPException(status_code=409, detail="The DTU example scrape is already in progress.")
 
     active_scrapes.add("example_1")
-    scrapetime_of_each_person = set()
 
     try:
         # Fetch all researchers by allowing the default 10000 limit
@@ -536,7 +530,7 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
         total_researchers = len(researchers)
 
         #print(f"\n--- Starting bulk fetch of {total_researchers} female DTU researchers ---")
-
+        #print(total_researchers)
         results = []
         for index, researcher in enumerate(researchers):
             q_id = researcher["q_id"]
@@ -549,8 +543,6 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
             if not article:
                 try:
                     # Scrapes Wikipedia and immediately commits to the database
-
-
                     scraped = await sync_article_by_qid(q_id, db)
                     ref_count = scraped["new_references_added"] + scraped["existing_references_updated"]
                     result = await db.execute(stmt)
