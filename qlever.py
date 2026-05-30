@@ -64,9 +64,7 @@ async def execute_sparql(query: str, max_retries: int = 5) -> dict:
                 logging.error(f"QLever connection failed unexpectedly: {repr(e)}")
                 raise e
 
-async def resolve_references_batch(
-        dois: list[str], qids: list[str]
-) -> tuple[dict[str, str], dict[str, dict]]:
+async def resolve_references_batch(dois: list[str], qids: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
     if not dois and not qids:
         return {}, {}
 
@@ -85,11 +83,11 @@ async def resolve_references_batch(
         values_str = " ".join(f"wd:{qid}" for qid in qids)
         union_parts.append(f"""
         {{
-          BIND("qid" AS ?queryType)
-          VALUES ?item {{ {values_str} }}
-          OPTIONAL {{ ?item wdt:P356 ?doi . }}
-          OPTIONAL {{ ?item wdt:P698 ?pmid . }}
-          OPTIONAL {{ ?item wdt:P818 ?arxiv . }}
+            BIND("qid" AS ?queryType)
+            VALUES ?item {{ {values_str} }}
+            OPTIONAL {{ ?item wdt:P356 ?doi . }}
+            OPTIONAL {{ ?item wdt:P698 ?pmid . }}
+            OPTIONAL {{ ?item wdt:P818 ?arxiv . }}
         }}""")
 
     union_str = " UNION ".join(union_parts)
@@ -98,7 +96,7 @@ async def resolve_references_batch(
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
     PREFIX wd: <http://www.wikidata.org/entity/>
     SELECT ?queryType ?inputDoi ?item ?doi ?pmid ?arxiv WHERE {{
-      {union_str}
+        {union_str}
     }} LIMIT 10000
     """
     data = await execute_sparql(query)
@@ -146,7 +144,9 @@ async def get_entity_context(q_id: str) -> dict:
       }} UNION {{
         BIND("work" AS ?resultType)
         ?work wdt:P50 wd:{q_id} .
-        OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
+        OPTIONAL {{ ?work rdfs:label ?enWorkLabel . FILTER(LANG(?enWorkLabel) = "en") }}
+        OPTIONAL {{ ?work rdfs:label ?mulWorkLabel . FILTER(LANG(?mulWorkLabel) = "mul") }}
+        BIND(COALESCE(?enWorkLabel, ?mulWorkLabel) AS ?workLabel)
         OPTIONAL {{ ?work wdt:P356 ?doi . }}
         OPTIONAL {{ ?work wdt:P698 ?pmid . }}
         OPTIONAL {{ ?work wdt:P818 ?arxiv . }}
@@ -212,8 +212,10 @@ async def get_author_works(author_qid: str) -> list[dict]:
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?work ?workLabel WHERE {{
-      ?work wdt:P50 wd:{author_qid.upper()} .
-      OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
+        ?work wdt:P50 wd:{author_qid.upper()} .
+        OPTIONAL {{ ?work rdfs:label ?enWorkLabel . FILTER(LANG(?enWorkLabel) = "en") }}
+        OPTIONAL {{ ?work rdfs:label ?mulWorkLabel . FILTER(LANG(?mulWorkLabel) = "mul") }}
+        BIND(COALESCE(?enWorkLabel, ?mulWorkLabel) AS ?workLabel)
     }} LIMIT 10000
     """
     data = await execute_sparql(query)
@@ -241,8 +243,10 @@ async def get_work_authors(work_qid: str) -> list[dict]:
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?author ?authorLabel WHERE {{
-      wd:{work_qid.upper()} wdt:P50 ?author .
-      OPTIONAL {{ ?author rdfs:label ?authorLabel . FILTER(LANG(?authorLabel) = "en") }}
+        wd:{work_qid.upper()} wdt:P50 ?author .
+        OPTIONAL {{ ?author rdfs:label ?enAuthorLabel . FILTER(LANG(?enAuthorLabel) = "en") }}
+        OPTIONAL {{ ?author rdfs:label ?mulAuthorLabel . FILTER(LANG(?mulAuthorLabel) = "mul") }}
+        BIND(COALESCE(?enAuthorLabel, ?mulAuthorLabel) AS ?authorLabel)
     }} LIMIT 10000
     """
     data = await execute_sparql(query)
@@ -270,8 +274,10 @@ async def get_entity_classification(q_id: str) -> str:
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?type ?typeLabel WHERE {{
-      wd:{q_id.upper()} wdt:P31 ?type .
-      OPTIONAL {{ ?type rdfs:label ?typeLabel . FILTER(LANG(?typeLabel) = "en") }}
+        wd:{q_id.upper()} wdt:P31 ?type .
+        OPTIONAL {{ ?type rdfs:label ?enTypeLabel . FILTER(LANG(?enTypeLabel) = "en") }}
+        OPTIONAL {{ ?type rdfs:label ?mulTypeLabel . FILTER(LANG(?mulTypeLabel) = "mul") }}
+        BIND(COALESCE(?enTypeLabel, ?mulTypeLabel) AS ?typeLabel)
     }} LIMIT 1
     """
     try:
@@ -311,10 +317,15 @@ async def get_citations_for_author(author_qid: str) -> list[dict]:
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?citingWork ?citingWorkLabel ?work ?workLabel WHERE {{
-      ?work wdt:P50 wd:{author_qid} .
-      ?citingWork wdt:P2860 ?work .
-      OPTIONAL {{ ?citingWork rdfs:label ?citingWorkLabel . FILTER(LANG(?citingWorkLabel) = "en") }}
-      OPTIONAL {{ ?work rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
+        ?work wdt:P50 wd:{author_qid} .
+        ?citingWork wdt:P2860 ?work .
+        OPTIONAL {{ ?citingWork rdfs:label ?enCitingWorkLabel . FILTER(LANG(?enCitingWorkLabel) = "en") }}
+        OPTIONAL {{ ?citingWork rdfs:label ?mulCitingWorkLabel . FILTER(LANG(?mulCitingWorkLabel) = "mul") }}
+        BIND(COALESCE(?enCitingWorkLabel, ?mulCitingWorkLabel) AS ?citingWorkLabel)
+
+        OPTIONAL {{ ?work rdfs:label ?enWorkLabel . FILTER(LANG(?enWorkLabel) = "en") }}
+        OPTIONAL {{ ?work rdfs:label ?mulWorkLabel . FILTER(LANG(?mulWorkLabel) = "mul") }}
+        BIND(COALESCE(?enWorkLabel, ?mulWorkLabel) AS ?workLabel)
     }} LIMIT 10000
     """
     data = await execute_sparql(query)
@@ -346,9 +357,14 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
     SELECT ?citingWork ?citingWorkLabel ?workLabel WHERE {{
-      ?citingWork wdt:P2860 wd:{work_qid} .
-      OPTIONAL {{ ?citingWork rdfs:label ?citingWorkLabel . FILTER(LANG(?citingWorkLabel) = "en") }}
-      OPTIONAL {{ wd:{work_qid} rdfs:label ?workLabel . FILTER(LANG(?workLabel) = "en") }}
+        ?citingWork wdt:P2860 wd:{work_qid} .
+        OPTIONAL {{ ?citingWork rdfs:label ?enCitingWorkLabel . FILTER(LANG(?enCitingWorkLabel) = "en") }}
+        OPTIONAL {{ ?citingWork rdfs:label ?mulCitingWorkLabel . FILTER(LANG(?mulCitingWorkLabel) = "mul") }}
+        BIND(COALESCE(?enCitingWorkLabel, ?mulCitingWorkLabel) AS ?citingWorkLabel)
+
+        OPTIONAL {{ wd:{work_qid} rdfs:label ?enWorkLabel . FILTER(LANG(?enWorkLabel) = "en") }}
+        OPTIONAL {{ wd:{work_qid} rdfs:label ?mulWorkLabel . FILTER(LANG(?mulWorkLabel) = "mul") }}
+        BIND(COALESCE(?enWorkLabel, ?mulWorkLabel) AS ?workLabel)
     }} LIMIT 10000
     """
     data = await execute_sparql(query)
@@ -371,7 +387,7 @@ async def get_citations_to_work(work_qid: str) -> list[dict]:
 async def get_female_dtu_researchers(limit: int = 10000) -> list[dict]:
     """
     Queries Wikidata for female (Q6581072) individuals whose employer (P108)
-    is currently the Technical University of Denmark (Q211115).
+    is currently the Technical University of Denmark (Q1269766).
     Filters out past employees by checking the 'end time' qualifier (P582).
     """
     query = f"""
@@ -383,22 +399,24 @@ async def get_female_dtu_researchers(limit: int = 10000) -> list[dict]:
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
     SELECT DISTINCT ?person ?personLabel WHERE {{
-      # Use p: to get the specific employment statement node
-      ?person p:P108 ?employmentStatement .
+        # Use p: to get the specific employment statement node
+        ?person p:P108 ?employmentStatement .
 
-      # Use ps: to verify the statement is specifically for DTU
-      ?employmentStatement ps:P108 wd:Q1269766 .
+        # Use ps: to verify the statement is specifically for DTU
+        ?employmentStatement ps:P108 wd:Q1269766 .
 
-      # Must be female
-      ?person wdt:P21 wd:Q6581072 .
+        # Must be female
+        ?person wdt:P21 wd:Q6581072 .
 
-      # Attempt to get the end time qualifier from the employment statement
-      OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
+        # Attempt to get the end time qualifier from the employment statement
+        OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
 
-      # Keep if there is no end time OR if the end time is in the future
-      FILTER (!BOUND(?endTime) || ?endTime >= NOW())
+        # Keep if there is no end time OR if the end time is in the future
+        FILTER (!BOUND(?endTime) || ?endTime >= NOW())
 
-      OPTIONAL {{ ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en") }}
+        OPTIONAL {{ ?person rdfs:label ?enLabel . FILTER(LANG(?enLabel) = "en") }}
+        OPTIONAL {{ ?person rdfs:label ?mulLabel . FILTER(LANG(?mulLabel) = "mul") }}
+        BIND(COALESCE(?enLabel, ?mulLabel) AS ?personLabel)
     }} LIMIT {limit}
     """
     data = await execute_sparql(query)
@@ -432,19 +450,21 @@ async def get_institute_researchers(institute_qid: str, limit: int = 10000) -> l
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
     SELECT DISTINCT ?person ?personLabel WHERE {{
-      # Use p: to get the specific employment statement node
-      ?person p:P108 ?employmentStatement .
+        # Use p: to get the specific employment statement node
+        ?person p:P108 ?employmentStatement .
 
-      # Use ps: to verify the statement is specifically for the given institute
-      ?employmentStatement ps:P108 wd:{institute_qid} .
+        # Use ps: to verify the statement is specifically for the given institute
+        ?employmentStatement ps:P108 wd:{institute_qid} .
 
-      # Attempt to get the end time qualifier from the employment statement
-      OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
+        # Attempt to get the end time qualifier from the employment statement
+        OPTIONAL {{ ?employmentStatement pq:P582 ?endTime . }}
 
-      # Keep if there is no end time OR if the end time is in the future
-      FILTER (!BOUND(?endTime) || ?endTime >= NOW())
+        # Keep if there is no end time OR if the end time is in the future
+        FILTER (!BOUND(?endTime) || ?endTime >= NOW())
 
-      OPTIONAL {{ ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en") }}
+        OPTIONAL {{ ?person rdfs:label ?enLabel . FILTER(LANG(?enLabel) = "en") }}
+        OPTIONAL {{ ?person rdfs:label ?mulLabel . FILTER(LANG(?mulLabel) = "mul") }}
+        BIND(COALESCE(?enLabel, ?mulLabel) AS ?personLabel)
     }} LIMIT {limit}
     """
     data = await execute_sparql(query)

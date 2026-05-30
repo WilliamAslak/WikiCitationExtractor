@@ -72,11 +72,11 @@ async def sync_article_by_qid(q_id: str, db: AsyncSession, rescrape = False):
     if q_id in active_scrapes:
         raise HTTPException(status_code=409, detail=f"A scrape for {q_id} is already in progress.")
 
+    if not re.match(r"^Q\d+$", q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
+
     active_scrapes.add(q_id)
     try:
-        if not re.match(r"^Q\d+$", q_id):
-            raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
-
         try:
             context = await get_entity_context(q_id)
             if not context.get("labels") and not context.get("works") and not context.get("doi"):
@@ -277,13 +277,27 @@ async def refresh_all_articles(db: AsyncSession = Depends(get_db)):
             "total_processed": total_articles,
             "details": f"{count[0]} new references has been added and {count[1]} references has been updated"
         }
+    except Exception as e:
+        logging.error(f"Failed to refresh: {e}")
+        raise e
     finally:
         active_scrapes.discard("refresh")
 
 
 @app.get("/scrape/{q_id}/")
 async def scrape_article_endpoint(q_id: str, db: AsyncSession = Depends(get_db)):
-    return await sync_article_by_qid(q_id, db, rescrape = True)
+    q_id = q_id.strip().upper()
+
+    if not re.match(r"^Q\d+$", q_id):
+        raise HTTPException(status_code=400, detail="Invalid Q-ID format.")
+
+    # Does q_id exist in the db?
+    stmt = select(Article.q_id).where(Article.q_id == q_id)
+    result = await db.execute(stmt)
+    exists_in_db = result.scalars().first() is not None
+    #print(exists_in_db)
+    # If item already exists in database then trigger full rescrape, otherwise use whats already in the database.
+    return await sync_article_by_qid(q_id, db, rescrape = exists_in_db)
 
 
 @app.get("/database/dump/")
@@ -384,9 +398,7 @@ async def get_article_by_qid(q_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.get("/stats/")
 async def get_stats(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(func.count(Reference.id)).where(Reference.ref_type == "cite q")
-    )
+    result = await db.execute(select(func.count(Reference.id)).where(Reference.ref_type == "cite q"))
     cite_q_count = result.scalar()
     return {"cite_q_usage_count": cite_q_count}
 
@@ -466,9 +478,7 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
 
     local_refs = []
     if citing_qids:
-        stmt = (
-            select(Reference).where(Reference.q_id.in_(citing_qids))
-        )
+        stmt = (select(Reference).where(Reference.q_id.in_(citing_qids)))
         result = await db.execute(stmt)
         local_refs = result.scalars().all()
 
@@ -502,6 +512,8 @@ async def get_references_to_entity(q_id: str, db: AsyncSession = Depends(get_db)
     }
 
 
+from datetime import datetime, timedelta
+
 @app.get("/example/1/")
 async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db)):
     """
@@ -509,19 +521,21 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
     If missing, scrapes Wikipedia and saves to DB continually.
     Prints progress to the console and resumes where it left off if interrupted.
     """
-
+    big_scrape_start = datetime.now()
+    print("The scrape has begun at ",big_scrape_start)
     global active_scrapes
     if "example_1" in active_scrapes:
         raise HTTPException(status_code=409, detail="The DTU example scrape is already in progress.")
 
     active_scrapes.add("example_1")
+    scrapetime_of_each_person = set()
 
     try:
         # Fetch all researchers by allowing the default 10000 limit
         researchers = await get_female_dtu_researchers()
         total_researchers = len(researchers)
 
-        print(f"\n--- Starting bulk scrape of {total_researchers} female DTU researchers ---")
+        #print(f"\n--- Starting bulk fetch of {total_researchers} female DTU researchers ---")
 
         results = []
         for index, researcher in enumerate(researchers):
@@ -535,11 +549,16 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
             if not article:
                 try:
                     # Scrapes Wikipedia and immediately commits to the database
+
+
                     scraped = await sync_article_by_qid(q_id, db)
                     ref_count = scraped["new_references_added"] + scraped["existing_references_updated"]
                     result = await db.execute(stmt)
                     article = result.scalars().first()
                     #print("Done.")
+                    if index % 5 == 4:
+                        print(f"{(max(1, index) / total_researchers) * 100:.2f}% complete. ({total_researchers - index} researchers remaining)")
+                        #break
                 except Exception as e:
                     logging.error(f"Failed! Error: {e}")
             else:
@@ -554,10 +573,9 @@ async def example_most_referenced_female_dtu(db: AsyncSession = Depends(get_db))
                 "reference_count": ref_count
             })
 
-            if index % 5 == 0:
-                print(f"{(max(1,index)/total_researchers)*100:.2f}% complete. ({total_researchers-index} researchers remaining)")
 
-        print("--- Bulk scrape finished ---\n")
+        #print("--- Bulk fetch finished ---\n")
+
 
         results.sort(key=lambda x: x["reference_count"], reverse=True)
 
@@ -594,7 +612,7 @@ async def example_most_referenced_at_institute(institute: str, db: AsyncSession 
         if total_researchers == 0:
             return {"message": f"No active researchers found on Wikidata for {institute_q_id}."}
 
-        print(f"\n--- Starting bulk scrape of {total_researchers} researchers at {institute_q_id} ---")
+        #print(f"\n--- Starting bulk fetch of {total_researchers} researchers at {institute_q_id} ---")
 
         results = []
         for index, researcher in enumerate(researchers):
@@ -612,6 +630,9 @@ async def example_most_referenced_at_institute(institute: str, db: AsyncSession 
                     ref_count = scraped["new_references_added"]+scraped["existing_references_updated"]
                     result = await db.execute(stmt)
                     article = result.scalars().first()
+
+                    #if index % 5 == 0:
+                    print(f"{(max(1, index) / total_researchers) * 100:.2f}% complete. ({total_researchers - index} researchers remaining)")
                 except Exception as e:
                     logging.error(f"Failed to scrape {q_id}: {e}")
             else:
@@ -625,10 +646,7 @@ async def example_most_referenced_at_institute(institute: str, db: AsyncSession 
                 "reference_count": ref_count
             })
 
-            if index % 5 == 0:
-                print(f"{(max(1,index)/total_researchers)*100:.2f}% complete. ({total_researchers - index} researchers remaining)")
-
-        print("--- Bulk scrape finished ---\n")
+        #print("--- Bulk fetch finished ---\n")
 
         results.sort(key=lambda x: x["reference_count"], reverse=True)
 

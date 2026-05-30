@@ -11,7 +11,7 @@ class Article(Base):
     q_id = Column(String(50), primary_key=True, index=True)
     name = Column(Text, nullable=False)
     # possible types: Person, Work and Unknown
-    entity_type = Column(String(50), default="unknown")
+    entity_type = Column(String(50), default="unknown", index=True)
     references = relationship("Reference", back_populates="article", cascade="all, delete-orphan")
 
 # The bridge between an author and their related work.

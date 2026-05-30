@@ -12,9 +12,6 @@ _SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 _FETCH_SEMAPHORE = asyncio.Semaphore(10)
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
 def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: int = 200) -> str:
     # Find the specific nth occurrence of the tag string
     pos = -1
@@ -51,24 +48,11 @@ def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: in
     return left_text.strip()
 
 
-def normalize_lang_code(lang: str) -> str | None:
-    lang = lang.lower()
-    if lang == "mul":
-        return None
-    if "-" in lang:
-        return lang.split("-")[0]
-    return lang
-
-
-# ---------------------------------------------------------------------------
-# Wikidata / Wikipedia API calls
-# ---------------------------------------------------------------------------
-
-async def fetch_with_retry(method: str, url: str, semaphore: asyncio.Semaphore, max_retries: int = 4, params: dict | None = None,
+async def fetch_with_retry(method: str, url: str, semaphore: asyncio.Semaphore, max_retries: int = 5, params: dict | None = None,
         data: dict | None = None, timeout: float = 15.0) -> httpx.Response:
     """Generic HTTP request executor with explicit parameters and backoff."""
 
-    headers = {"User-Agent": f"{settings.bot_name}/1.0 (Contact: {settings.contact_email})"}
+    headers = {"User-Agent": f"{settings.bot_name}/{settings.bot_version} (Contact: {settings.contact_email})"}
 
     async with semaphore:
         async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
@@ -150,7 +134,7 @@ async def get_sitelinks_from_qid(q_id: str) -> dict[str, str]:
     return urls
 
 
-async def find_mentions_via_search_query(lang: str, query_str: str, max_total: int = 50) -> list[str]:
+async def find_mentions_via_search_query(lang: str, query_str: str) -> list[str]:
     endpoint = f"https://{lang}.wikipedia.org/w/api.php"
     all_titles: list[str] = []
 
@@ -159,16 +143,16 @@ async def find_mentions_via_search_query(lang: str, query_str: str, max_total: i
         "list": "search",
         "srsearch": query_str,
         "srnamespace": "0",
-        "srlimit": "50",
+        "srlimit": "max",
         "format": "json",
     }
 
-    while len(all_titles) < max_total:
+    while True:
         try:
             resp_json = (await fetch_with_retry("POST", endpoint, _SEARCH_SEMAPHORE, data=data, timeout=15.0)).json()
         except Exception as e:
             logging.warning(f"Could not reach {lang}.wikipedia.org for mentions: {e}")
-            return all_titles
+            raise e
 
         batch = [item["title"] for item in resp_json.get("query", {}).get("search", [])]
         all_titles.extend(batch)
@@ -177,12 +161,8 @@ async def find_mentions_via_search_query(lang: str, query_str: str, max_total: i
             break
         data.update(resp_json["continue"])
 
-    return all_titles[:max_total]
+    return all_titles
 
-
-# ---------------------------------------------------------------------------
-# Per-page scraping
-# ---------------------------------------------------------------------------
 
 async def _fetch_and_parse_multiple_mentions(lang: str, candidate_title: str, targets: list[dict]) -> list[dict]:
     domain = f"{lang}.wikipedia.org"
@@ -281,7 +261,7 @@ async def _fetch_and_parse_multiple_mentions(lang: str, candidate_title: str, ta
 async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]:
     candidate_titles = set()
 
-    # 1. Flatten all identifiers into a single list of search terms
+    # Flatten all identifiers into a single list of search terms
     # We force everything that is case-insensitive (DOIs, arXivs) into lowercase here.
     search_terms = []
     for t in targets:
@@ -294,8 +274,8 @@ async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]
         if t.get("arxiv"):
             search_terms.append(f'"{t["arxiv"].strip().lower()}"')
 
-    # 2. Wikipedia's CirrusSearch has a strict limit of 300 characters per query.
-    # We dynamically chunk our terms so no single "OR" string exceeds 250 characters.
+    # Wikipedia's CirrusSearch has a strict limit of 300 characters per query.
+    # We dynamically chunk our terms so no single "OR" string exceeds 250 characters. (not 300 to be safe)
     queries = []
     current_chunk = []
     current_len = 0
@@ -315,7 +295,7 @@ async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]
     if current_chunk:
         queries.append(" OR ".join(current_chunk))
 
-    # 3. Execute all dynamically sized search queries
+    # Execute all dynamically sized search queries
     for query_str in queries:
         if not query_str:
             continue
@@ -325,11 +305,8 @@ async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]
     if not candidate_titles:
         return []
 
-    # 4. Fetch the candidate articles and parse them
-    tasks = [
-        _fetch_and_parse_multiple_mentions(lang, title, targets)
-        for title in candidate_titles
-    ]
+    # Fetch the candidate articles and parse them
+    tasks = [_fetch_and_parse_multiple_mentions(lang, title, targets) for title in candidate_titles]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -342,9 +319,6 @@ async def _scrape_mentions_batched(lang: str, targets: list[dict]) -> list[dict]
 
     return extracted
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 async def scrape_targets(targets: list[dict], main_qid: str) -> list[dict]:
     """Takes a pre-filtered list of targets to strictly search Wikipedia for."""
@@ -354,7 +328,7 @@ async def scrape_targets(targets: list[dict], main_qid: str) -> list[dict]:
     main_qid = main_qid.strip().upper()
     sitelinks = await get_sitelinks_from_qid(main_qid)
 
-    base_langs = {"en", "de", "da", "fr", "es", "sv", "no", "nl"}
+    base_langs = {"en", "de", "da", "fr", "es", "sv", "no", "nl", "pt"}
     if sitelinks:
         base_langs.update(sitelinks.keys())
 
