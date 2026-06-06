@@ -5,7 +5,7 @@ Can be installed with pip
 pip install fastapi uvicorn sqlalchemy aiomysql httpx mwparserfromhell pydantic-settings cryptography
 
 #start server
-uvicorn main:app --reload
+uvicorn main:app
 
 # Once the server is running, you can interact with the API (default: http://localhost:8000).
 GET /: Root endpoint with a welcome message and directory of endpoints.
