@@ -12,7 +12,7 @@ _SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 _FETCH_SEMAPHORE = asyncio.Semaphore(10)
 
 
-def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: int = 200) -> str:
+def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: int = 1500) -> str:
     # Find the specific nth occurrence of the tag string
     pos = -1
     for _ in range(occurrence + 1):
@@ -20,32 +20,25 @@ def extract_context(wikitext: str, tag_str: str, occurrence: int = 0, window: in
         if pos == -1:
             return ""
 
-    # Grab a larger initial chunk to account for very long preceding references
-    search_window = window + 2000
-    start = max(0, pos - search_window)
-    left_text = wikitext[start:pos]
+    # Pass the entire text up to the target position.
+    # Parse the preceding wikitext into parsed plain text
+    parsed_text = mwparserfromhell.parse(wikitext[:pos]).strip_code()
 
-    # Stop at the most recent linebreak
-    last_newline = left_text.rfind("\n")
+    # Find the most recent linebreak
+    last_newline = parsed_text.rfind("\n")
     if last_newline != -1:
-        left_text = left_text[last_newline + 1:]
+        parsed_text = parsed_text[last_newline + 1:]
 
-    # Remove all complete <ref>...</ref> tags
-    left_text = re.sub(r'<ref[^>]*>.*?</ref>', '', left_text, flags=re.DOTALL | re.IGNORECASE)
+    # Apply the character window
+    if len(parsed_text) > window:
+        parsed_text = parsed_text[-window:]
 
-    # Remove all self-closing <ref ... /> tags
-    left_text = re.sub(r'<ref[^>]*/>', '', left_text, flags=re.IGNORECASE)
-
-    # Now take the final `window` characters of the cleaned text
-    if len(left_text) > window:
-        left_text = left_text[-window:]
-
-        # Find the first space to remove any cut-off word at the beginning
-        first_space = left_text.find(" ")
+        # Find the first . to remove any cut-off sentence at the beginning
+        first_space = parsed_text.find(".")
         if first_space != -1:
-            left_text = left_text[first_space + 1:]
+            parsed_text = parsed_text[first_space + 1:]
 
-    return left_text.strip()
+    return parsed_text.strip()
 
 
 async def fetch_with_retry(method: str, url: str, semaphore: asyncio.Semaphore, max_retries: int = 5, params: dict | None = None,
@@ -200,8 +193,7 @@ async def _fetch_and_parse_multiple_mentions(lang: str, candidate_title: str, ta
 
         for tpl in templates:
             tpl_name = str(tpl.name).strip().lower()[:50]
-            if "cite" in tpl_name or "citation" in tpl_name or "literatur" in tpl_name:
-                ref_type = tpl_name
+            ref_type = tpl_name
 
             for param in tpl.params:
                 p_name = str(param.name).strip().lower()
